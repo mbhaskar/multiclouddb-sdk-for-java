@@ -96,17 +96,64 @@ stages:
                         }
                       }
 
-                      $profiles = & mvn help:all-profiles -Ddetail=false -DskipTests 2>&1
+                      $profiles = & mvn help:active-profiles -Plive-cosmos `
+                        -pl multiclouddb-conformance -DskipTests 2>&1
                       if ($LASTEXITCODE -ne 0) {
-                        $errors.Add('Maven could not enumerate profiles; inspect the preflight log.')
-                      } elseif (-not ($profiles | Select-String -SimpleMatch 'Profile Id: live-cosmos')) {
+                        $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
+                      } elseif (-not ($profiles | Select-String -Pattern '^\s*-\s+live-cosmos\s')) {
                         $errors.Add(@'
-                      The required Maven profile 'live-cosmos' does not exist yet. Add a profile and
-                      live-only Cosmos tests that omit cosmos.key, require cosmos.endpoint, use
+                      The required Maven profile 'live-cosmos' does not exist or did not activate.
+                      Add it with a dedicated com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
+                      sentinel. The profile must omit cosmos.key, require cosmos.endpoint, use
                       DefaultAzureCredential, fail rather than skip when prerequisites are absent,
-                      and isolate/clean up run-scoped fixtures. Do not reuse emulator-cosmos: it
-                      injects the emulator key and relaxes Java TLS security.
+                      and isolate/clean up run-scoped fixtures.
                       '@)
+                      }
+
+                      if ($errors.Count -eq 0) {
+                        $effectivePom = Join-Path '$(Agent.TempDirectory)' 'live-cosmos-effective-pom.xml'
+                        & mvn help:effective-pom -Plive-cosmos -pl multiclouddb-conformance `
+                          -DskipTests "-Doutput=$effectivePom"
+                        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $effectivePom)) {
+                          $errors.Add('Maven could not produce the activated live-cosmos effective POM.')
+                        } else {
+                          [xml]$effective = Get-Content -LiteralPath $effectivePom -Raw
+                          $surefire = @($effective.SelectNodes(
+                            "/*[local-name()='project']/*[local-name()='build']/*[local-name()='plugins']/" +
+                            "*[local-name()='plugin'][*[local-name()='artifactId']='maven-surefire-plugin']"))
+                          $effectiveKeys = @($surefire | ForEach-Object {
+                            $_.SelectNodes(".//*[local-name()='systemPropertyVariables']/*[local-name()='cosmos.key']")
+                          })
+                          $effectiveEndpoints = @($surefire | ForEach-Object {
+                            $_.SelectNodes(".//*[local-name()='systemPropertyVariables']/*[local-name()='cosmos.endpoint']")
+                          })
+                          $unsafeTls = @($surefire | ForEach-Object {
+                            $_.SelectNodes(".//*[local-name()='argLine']")
+                          } | Where-Object {
+                            $_.InnerText -match 'jdk\.(tls|certpath)\.disabledAlgorithms\s*=\s*""'
+                          })
+
+                          if ($effectiveKeys.Count -ne 0) {
+                            $errors.Add(@'
+                      The activated live-cosmos effective Surefire configuration still defines
+                      cosmos.key. Remove the conformance module's inherited emulator credential
+                      injection; overriding only the endpoint or adding a test tag is insecure.
+                      '@)
+                          }
+                          if ($effectiveEndpoints.Count -ne 0) {
+                            $errors.Add(@'
+                      The activated live-cosmos effective Surefire configuration still defines
+                      cosmos.endpoint. Remove the inherited emulator endpoint injection and accept
+                      only the required -Dcosmos.endpoint value supplied by this pipeline.
+                      '@)
+                          }
+                          if ($unsafeTls.Count -ne 0) {
+                            $errors.Add(@'
+                      The activated live-cosmos effective Surefire configuration contains emulator
+                      TLS algorithm relaxation. The live profile must not inherit emulator-cosmos.
+                      '@)
+                          }
+                        }
                       }
 
                       if ($errors.Count -gt 0) {
@@ -142,7 +189,12 @@ stages:
                         throw 'The WIF service connection could not establish an Azure CLI session.'
                       }
 
+                      # This exact future sentinel must perform a real Cosmos data-plane
+                      # operation using DefaultAzureCredential and fail (never skip) if
+                      # endpoint, Azure CLI auth, RBAC, or fixtures are unavailable.
                       mvn verify -Plive-cosmos -pl multiclouddb-conformance -am `
+                        -Dtest=LiveCosmosEntraAuthenticationTest `
+                        -Dsurefire.failIfNoSpecifiedTests=false `
                         "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT" `
                         -Djunit.jupiter.execution.timeout.default=60s `
                         -DtrimStackTrace=false
@@ -161,7 +213,8 @@ stages:
                   condition: always()
                   inputs:
                     testResultsFormat: JUnit
-                    testResultsFiles: 'multiclouddb-conformance/target/surefire-reports/TEST-*.xml'
+                    testResultsFiles: >-
+                      multiclouddb-conformance/target/surefire-reports/TEST-com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest.xml
                     searchFolder: $(Build.SourcesDirectory)
                     mergeTestResults: true
                     failTaskOnFailedTests: true
@@ -178,26 +231,26 @@ stages:
                       $ErrorActionPreference = 'Stop'
                       $reportDirectory = Join-Path '$(Build.SourcesDirectory)' `
                         'multiclouddb-conformance/target/surefire-reports'
-                      $files = @(Get-ChildItem $reportDirectory -Filter 'TEST-*.xml' `
-                        -File -ErrorAction SilentlyContinue)
-                      if ($files.Count -eq 0) {
-                        throw 'No Surefire results were produced; no Entra-authenticated operation was validated.'
+                      $report = Join-Path $reportDirectory `
+                        'TEST-com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest.xml'
+                      if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
+                        throw 'The dedicated LiveCosmosEntraAuthenticationTest report was not produced.'
                       }
 
+                      [xml]$result = Get-Content -LiteralPath $report -Raw
+                      $cases = @($result.SelectNodes(
+                        "//testcase[@classname='com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest']"))
                       $total = 0
                       $failed = 0
                       $skipped = 0
-                      foreach ($file in $files) {
-                        [xml]$result = Get-Content -LiteralPath $file.FullName -Raw
-                        foreach ($suite in @($result.SelectNodes('//testsuite'))) {
-                          $total += [int]$suite.tests
-                          $failed += [int]$suite.failures + [int]$suite.errors
-                          $skipped += [int]$suite.skipped
-                        }
+                      foreach ($case in $cases) {
+                        $total++
+                        $failed += @($case.SelectNodes('./failure | ./error')).Count
+                        $skipped += @($case.SelectNodes('./skipped')).Count
                       }
 
                       $passed = $total - $failed - $skipped
                       Write-Host "total=$total passed=$passed failed=$failed skipped=$skipped"
                       if ($total -lt 1 -or $passed -lt 1 -or $failed -ne 0 -or $skipped -ne 0) {
-                        throw 'Live Cosmos DB results must contain at least one passing test and no failed or skipped tests.'
+                        throw 'LiveCosmosEntraAuthenticationTest must contain at least one passing case and no failed or skipped cases.'
                       }
