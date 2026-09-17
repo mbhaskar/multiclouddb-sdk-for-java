@@ -5,8 +5,9 @@
 #   service connection and the multiclouddb-cosmos-live environment;
 # - add an exclusive-lock check to that environment (this pipeline requests
 #   sequential lock behavior because today's tests use shared fixture names);
-# - grant the pipeline access to the selected pool and restrict manual runs and
-#   variable changes to trusted maintainers;
+# - grant this pipeline access to the approved OneES pool; do not authorize the
+#   live WIF service connection for jobs on alternate or queue-selectable pools;
+# - restrict manual runs and variable changes to trusted maintainers;
 # - set COSMOS_ENDPOINT as a non-secret pipeline variable;
 # - keep fork builds unable to request this pipeline or its protected resources.
 
@@ -26,16 +27,6 @@ schedules:
         - main
     always: true
 
-parameters:
-  - name: poolName
-    displayName: Approved ADO agent pool
-    type: string
-    default: OneES
-  - name: vmImage
-    displayName: Microsoft-hosted image (leave empty for poolName)
-    type: string
-    default: ''
-
 lockBehavior: sequential
 
 stages:
@@ -49,10 +40,8 @@ stages:
         displayName: Cosmos DB live conformance (Entra ID)
         timeoutInMinutes: 60
         pool:
-          ${{ if ne(parameters.vmImage, '') }}:
-            vmImage: ${{ parameters.vmImage }}
-          ${{ else }}:
-            name: ${{ parameters.poolName }}
+          # Keep the protected WIF identity bound to the approved runner.
+          name: OneES
         environment: multiclouddb-cosmos-live
         strategy:
           runOnce:
@@ -100,7 +89,7 @@ stages:
                         -pl multiclouddb-conformance -DskipTests 2>&1
                       if ($LASTEXITCODE -ne 0) {
                         $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
-                      } elseif (-not ($profiles | Select-String -Pattern '^\s*-\s+live-cosmos\s')) {
+                      } elseif (-not ($profiles | Select-String -Pattern '^(?:\[[A-Z]+\]\s+)?\s*-\s+live-cosmos\s+\(source:')) {
                         $errors.Add(@'
                       The required Maven profile 'live-cosmos' does not exist or did not activate.
                       Add it with a dedicated com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
@@ -130,7 +119,7 @@ stages:
                           $unsafeTls = @($surefire | ForEach-Object {
                             $_.SelectNodes(".//*[local-name()='argLine']")
                           } | Where-Object {
-                            $_.InnerText -match 'jdk\.(tls|certpath)\.disabledAlgorithms\s*=\s*""'
+                            $_.InnerText -match '(?<![A-Za-z0-9_.])(?:-D)?jdk\.(?:tls|certpath)\.disabledAlgorithms(?:\s*=|\s|$)'
                           })
 
                           if ($effectiveKeys.Count -ne 0) {
