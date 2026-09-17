@@ -1,0 +1,203 @@
+# Live Cosmos DB conformance starter for the cosmos-db-sdk-public ADO project.
+#
+# ADO administrators must:
+# - authorize only this pipeline to use the multiclouddb-cosmos-live-ci WIF
+#   service connection and the multiclouddb-cosmos-live environment;
+# - add an exclusive-lock check to that environment (this pipeline requests
+#   sequential lock behavior because today's tests use shared fixture names);
+# - grant the pipeline access to the selected pool and restrict manual runs and
+#   variable changes to trusted maintainers;
+# - set COSMOS_ENDPOINT as a non-secret pipeline variable;
+# - keep fork builds unable to request this pipeline or its protected resources.
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+
+pr: none
+
+schedules:
+  - cron: '0 5 * * *'
+    displayName: Nightly live Cosmos DB validation
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+  - name: poolName
+    displayName: Approved ADO agent pool
+    type: string
+    default: OneES
+  - name: vmImage
+    displayName: Microsoft-hosted image (leave empty for poolName)
+    type: string
+    default: ''
+
+lockBehavior: sequential
+
+stages:
+  - stage: LiveCosmos
+    displayName: Cosmos DB live-account tests
+    # Manual runs are also limited to main; selecting an arbitrary branch must
+    # never make that branch eligible to reach the protected live identity.
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: CosmosLiveConformance
+        displayName: Cosmos DB live conformance (Entra ID)
+        timeoutInMinutes: 60
+        pool:
+          ${{ if ne(parameters.vmImage, '') }}:
+            vmImage: ${{ parameters.vmImage }}
+          ${{ else }}:
+            name: ${{ parameters.poolName }}
+        environment: multiclouddb-cosmos-live
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+                  fetchDepth: 1
+                  persistCredentials: false
+
+                - task: JavaToolInstaller@0
+                  displayName: Use Java 17
+                  inputs:
+                    versionSpec: '17'
+                    jdkArchitectureOption: x64
+                    jdkSourceOption: PreInstalled
+
+                - task: PowerShell@2
+                  displayName: Preflight live Cosmos DB configuration
+                  inputs:
+                    targetType: inline
+                    pwsh: true
+                    script: |
+                      $ErrorActionPreference = 'Stop'
+                      $errors = [System.Collections.Generic.List[string]]::new()
+                      $endpoint = $env:COSMOS_ENDPOINT
+
+                      if ([string]::IsNullOrWhiteSpace($endpoint) -or $endpoint.StartsWith('$(')) {
+                        $errors.Add('Set the non-secret COSMOS_ENDPOINT pipeline variable to the live Cosmos DB account URI.')
+                      } else {
+                        $uri = $null
+                        if (-not [System.Uri]::TryCreate($endpoint, [System.UriKind]::Absolute, [ref]$uri) `
+                            -or $uri.Scheme -ne 'https' `
+                            -or $uri.UserInfo `
+                            -or $uri.Query `
+                            -or $uri.Fragment `
+                            -or (-not $uri.IsDefaultPort -and $uri.Port -ne 443) `
+                            -or $uri.AbsolutePath -ne '/' `
+                            -or $uri.Host -notmatch '\.documents\.azure\.(com|us|cn|de)$') {
+                          $errors.Add('COSMOS_ENDPOINT must be an HTTPS Cosmos account URI such as https://account.documents.azure.com:443/.')
+                        }
+                      }
+
+                      $profiles = & mvn help:all-profiles -Ddetail=false -DskipTests 2>&1
+                      if ($LASTEXITCODE -ne 0) {
+                        $errors.Add('Maven could not enumerate profiles; inspect the preflight log.')
+                      } elseif (-not ($profiles | Select-String -SimpleMatch 'Profile Id: live-cosmos')) {
+                        $errors.Add(@'
+                      The required Maven profile 'live-cosmos' does not exist yet. Add a profile and
+                      live-only Cosmos tests that omit cosmos.key, require cosmos.endpoint, use
+                      DefaultAzureCredential, fail rather than skip when prerequisites are absent,
+                      and isolate/clean up run-scoped fixtures. Do not reuse emulator-cosmos: it
+                      injects the emulator key and relaxes Java TLS security.
+                      '@)
+                      }
+
+                      if ($errors.Count -gt 0) {
+                        foreach ($message in $errors) {
+                          Write-Host "##vso[task.logissue type=error]$($message -replace '\r?\n', ' ')"
+                        }
+                        throw "Live Cosmos DB preflight failed with $($errors.Count) configuration error(s)."
+                      }
+                  env:
+                    COSMOS_ENDPOINT: $(COSMOS_ENDPOINT)
+
+                - task: PowerShell@2
+                  displayName: Remove stale test results
+                  inputs:
+                    targetType: inline
+                    pwsh: true
+                    script: |
+                      Get-ChildItem '$(Build.SourcesDirectory)' -Recurse -Directory -Filter surefire-reports `
+                        -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+
+                - task: AzureCLI@2
+                  displayName: Run live Cosmos DB tests with WIF
+                  inputs:
+                    azureSubscription: multiclouddb-cosmos-live-ci
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    # AzureCLI logs in with the WIF service connection. Maven runs
+                    # in the same task so DefaultAzureCredential can use AzureCliCredential.
+                    inlineScript: |
+                      $ErrorActionPreference = 'Stop'
+                      az account show --query '{tenantId:tenantId, subscriptionId:id}' --output table
+                      if ($LASTEXITCODE -ne 0) {
+                        throw 'The WIF service connection could not establish an Azure CLI session.'
+                      }
+
+                      mvn verify -Plive-cosmos -pl multiclouddb-conformance -am `
+                        "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT" `
+                        -Djunit.jupiter.execution.timeout.default=60s `
+                        -DtrimStackTrace=false
+                      if ($LASTEXITCODE -ne 0) {
+                        throw "Live Cosmos DB tests failed with Maven exit code $LASTEXITCODE."
+                      }
+                  env:
+                    # Deliberately pass no account key or client secret.
+                    COSMOS_ENDPOINT: $(COSMOS_ENDPOINT)
+                    # azure-identity 1.18.2 supports narrowing
+                    # DefaultAzureCredential to this named credential.
+                    AZURE_TOKEN_CREDENTIALS: AzureCliCredential
+
+                - task: PublishTestResults@2
+                  displayName: Publish live Cosmos DB test results
+                  condition: always()
+                  inputs:
+                    testResultsFormat: JUnit
+                    testResultsFiles: 'multiclouddb-conformance/target/surefire-reports/TEST-*.xml'
+                    searchFolder: $(Build.SourcesDirectory)
+                    mergeTestResults: true
+                    failTaskOnFailedTests: true
+                    failTaskOnMissingResultsFile: true
+                    testRunTitle: Multicloud DB live Cosmos conformance
+
+                - task: PowerShell@2
+                  displayName: Verify live Cosmos DB results
+                  condition: always()
+                  inputs:
+                    targetType: inline
+                    pwsh: true
+                    script: |
+                      $ErrorActionPreference = 'Stop'
+                      $reportDirectory = Join-Path '$(Build.SourcesDirectory)' `
+                        'multiclouddb-conformance/target/surefire-reports'
+                      $files = @(Get-ChildItem $reportDirectory -Filter 'TEST-*.xml' `
+                        -File -ErrorAction SilentlyContinue)
+                      if ($files.Count -eq 0) {
+                        throw 'No Surefire results were produced; no Entra-authenticated operation was validated.'
+                      }
+
+                      $total = 0
+                      $failed = 0
+                      $skipped = 0
+                      foreach ($file in $files) {
+                        [xml]$result = Get-Content -LiteralPath $file.FullName -Raw
+                        foreach ($suite in @($result.SelectNodes('//testsuite'))) {
+                          $total += [int]$suite.tests
+                          $failed += [int]$suite.failures + [int]$suite.errors
+                          $skipped += [int]$suite.skipped
+                        }
+                      }
+
+                      $passed = $total - $failed - $skipped
+                      Write-Host "total=$total passed=$passed failed=$failed skipped=$skipped"
+                      if ($total -lt 1 -or $passed -lt 1 -or $failed -ne 0 -or $skipped -ne 0) {
+                        throw 'Live Cosmos DB results must contain at least one passing test and no failed or skipped tests.'
+                      }
