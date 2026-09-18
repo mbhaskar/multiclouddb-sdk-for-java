@@ -72,6 +72,55 @@ stages:
                       $ErrorActionPreference = 'Stop'
                       $errors = [System.Collections.Generic.List[string]]::new()
                       $endpoint = $env:COSMOS_ENDPOINT
+                      $trustedProjectBase = (Resolve-Path -LiteralPath `
+                        '$(Build.SourcesDirectory)').Path
+                      $currentProjectBase = (Resolve-Path -LiteralPath `
+                        (Get-Location).Path).Path
+                      if ($currentProjectBase -cne $trustedProjectBase) {
+                        $errors.Add(
+                          'Maven must run from the trusted Build.SourcesDirectory checkout.')
+                      }
+
+                      foreach ($baseVariable in @(
+                          'MAVEN_PROJECTBASEDIR',
+                          'MAVEN_BASEDIR')) {
+                        $configuredProjectBase = [Environment]::GetEnvironmentVariable(
+                          $baseVariable)
+                        if (-not [string]::IsNullOrWhiteSpace($configuredProjectBase)) {
+                          try {
+                            $resolvedProjectBase = (Resolve-Path -LiteralPath `
+                              $configuredProjectBase).Path
+                            if ($resolvedProjectBase -cne $trustedProjectBase) {
+                              $errors.Add(
+                                "$baseVariable must resolve to Build.SourcesDirectory.")
+                            }
+                          } catch {
+                            $errors.Add(
+                              "$baseVariable is set but does not resolve to the trusted checkout.")
+                          }
+                        }
+                      }
+
+                      $forbiddenMavenConfigPattern =
+                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)(?:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s|=)|-(?:s|gs|t|gt)(?:\s|=)|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
+                      foreach ($relativeConfigPath in @(
+                          '.mvn/maven.config',
+                          '.mvn/jvm.config')) {
+                        $configPath = Join-Path $trustedProjectBase $relativeConfigPath
+                        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+                          Write-Host "Inspecting Maven configuration file: $relativeConfigPath"
+                          $configText = Get-Content -LiteralPath $configPath -Raw
+                          if ($configText -match $forbiddenMavenConfigPattern) {
+                            $errors.Add(
+                              "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or TLS injection.")
+                          }
+                        }
+                      }
+                      $extensionsPath = Join-Path $trustedProjectBase '.mvn/extensions.xml'
+                      if (Test-Path -LiteralPath $extensionsPath) {
+                        $errors.Add(
+                          "Maven core extension file '.mvn/extensions.xml' is not permitted in the live WIF pipeline.")
+                      }
 
                       if ([string]::IsNullOrWhiteSpace($endpoint) -or $endpoint.StartsWith('$(')) {
                         $errors.Add('Set the non-secret COSMOS_ENDPOINT pipeline variable to the live Cosmos DB account URI.')
@@ -107,37 +156,45 @@ stages:
                         '_JAVA_OPTIONS',
                         'JDK_JAVA_OPTIONS',
                         'MAVEN_OPTS',
+                        'MAVEN_DEBUG_OPTS',
                         'MAVEN_ARGS'
                       )
                       foreach ($name in $forbiddenOptionVariables) {
                         $value = [Environment]::GetEnvironmentVariable($name)
                         if (-not [string]::IsNullOrWhiteSpace($value) `
-                            -and $value -match '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile)(?:\s*=|\s|$)') {
+                            -and $value -match $forbiddenMavenConfigPattern) {
                           $errors.Add(
-                            "Environment variable '$name' contains forbidden JVM property injection.")
+                            "Environment variable '$name' contains forbidden Maven/JVM injection.")
                         }
                       }
 
-                      $profiles = & mvn help:active-profiles -Plive-cosmos `
-                        -pl multiclouddb-conformance -DskipTests 2>&1
-                      # Maven returns exit code 0 for an unknown -P profile, so preserve
-                      # this exact profile-list check. Echoing help output is safe: it
-                      # contains profile metadata, not effective property values.
-                      $profiles | ForEach-Object { Write-Host $_ }
-                      if ($LASTEXITCODE -ne 0) {
-                        $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
-                      } elseif (-not ($profiles | Select-String -Pattern '^(?:\[[A-Z]+\]\s+)?\s*-\s+live-cosmos\s+\(source:')) {
-                        $errors.Add(@'
+                      if ($errors.Count -eq 0) {
+                        $profiles = & mvn help:active-profiles -Plive-cosmos `
+                          -pl multiclouddb-conformance -DskipTests 2>&1
+                        # Maven returns exit code 0 for an unknown -P profile, so preserve
+                        # this exact profile-list check. Echoing help output is safe: it
+                        # contains profile metadata, not effective property values.
+                        $profiles |
+                          Where-Object {
+                            $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
+                          } |
+                          ForEach-Object { Write-Host $_ }
+                        if ($LASTEXITCODE -ne 0) {
+                          $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
+                        } elseif (-not ($profiles | Select-String -Pattern '^(?:\[[A-Z]+\]\s+)?\s*-\s+live-cosmos\s+\(source:')) {
+                          $errors.Add(@'
                       The required Maven profile 'live-cosmos' does not exist or did not activate.
                       Add it with a dedicated com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
                       sentinel method named entraAuthenticationPerformsCreateReadDelete. That test
-                      must construct a live-specific MulticloudDbClientConfig with no key entry; it
+                      must construct a live-specific MulticloudDbClientConfig whose only connection
+                      setting is System.getProperty("cosmos.endpoint"), with no key/auth entries; it
                       must not call ConformanceConfig.forProvider(COSMOS), which defaults to the
                       emulator key. The profile must omit credential and endpoint injection, require
                       cosmos.endpoint, use DefaultAzureCredential, fail rather than skip when
                       prerequisites are absent, and isolate/clean up run-scoped fixtures.
                       '@
-                      )
+                          )
+                        }
                       }
 
                       if ($errors.Count -eq 0) {
@@ -297,13 +354,18 @@ stages:
                           if ($classStructure -match '\bConformanceConfig\b' `
                               -or $classStructure -match
                                 '\b(?:CosmosConstants\s*\.\s*)?CONFIG_KEY\b' `
-                              -or $classStructure -match '\.\s*key\s*\(') {
+                              -or $classStructure -match '\.\s*key\s*\(' `
+                              -or $classStructure -match '\.\s*auth\s*\(') {
                             $errors.Add(@'
-                      LiveCosmosEntraAuthenticationTest references ConformanceConfig or a key-based
-                      client configuration API. Build a live-specific MulticloudDbClientConfig with
-                      endpoint only so DefaultAzureCredential is selected.
+                      LiveCosmosEntraAuthenticationTest references ConformanceConfig or a key/auth
+                      configuration API. Build a live-specific MulticloudDbClientConfig with only
+                      the pipeline-supplied endpoint so DefaultAzureCredential is selected.
                       '@
                       )
+                          }
+                          if ($classStructure -match '@DisplayName\s*\(') {
+                            $errors.Add(
+                              'LiveCosmosEntraAuthenticationTest must not declare @DisplayName; use the exact default method name.')
                           }
 
                           $methodPattern = "(?s)@Test\s+(?:@\w+(?:\([^)]*\))?\s+)*(?:public\s+)?void\s+$sentinelMethod\s*\(\s*\)(?:\s+throws\s+[\w.,\s]+)?\s*\{"
@@ -364,11 +426,14 @@ stages:
                                 '\.\s*provider\s*\(\s*ProviderId\s*\.\s*COSMOS\s*\)') {
                               $missingContract.Add('ProviderId.COSMOS selection')
                             }
-                            if ($configCode -notmatch
-                                '\.\s*connection\s*\(\s*(?:"endpoint"|(?:CosmosConstants\s*\.\s*)?CONFIG_ENDPOINT)\s*,' `
+                            $endpointConnectionPattern =
+                              '\.\s*connection\s*\(\s*"endpoint"\s*,\s*System\s*\.\s*getProperty\s*\(\s*"cosmos\.endpoint"\s*\)\s*\)'
+                            if ($configCode -notmatch $endpointConnectionPattern `
                                 -or @([regex]::Matches(
-                                  $configCode, '\.\s*connection\s*\(')).Count -ne 1) {
-                              $missingContract.Add('one endpoint-only connection setting')
+                                  $configCode, '\.\s*connection\s*\(')).Count -ne 1 `
+                                -or $configCode -match '\.\s*auth\s*\(') {
+                              $missingContract.Add(
+                                'one endpoint-only connection bound directly to System.getProperty("cosmos.endpoint") and no auth settings')
                             }
 
                             $clientMatch = [regex]::Match(
@@ -466,22 +531,91 @@ stages:
                             $errors.Add(@"
                       LiveCosmosEntraAuthenticationTest#$sentinelMethod is missing required source
                       contract elements: $(($missingContract -join ', ')). The exact method must
-                      directly build an endpoint-only Cosmos config, create/read/verify/delete a
-                      run-scoped item, and delete in finally. These checks reject trivial sentinels;
-                      code review must still confirm the live operation and cleanup semantics.
+                      directly bind its sole endpoint to System.getProperty("cosmos.endpoint"),
+                      configure no key/auth entries, create/read/verify/delete a run-scoped item,
+                      and delete in finally. These checks reject trivial sentinels; code review must
+                      still confirm the live operation and cleanup semantics.
                       "@
                       )
                           }
                         }
 
-                        $effectivePom = Join-Path '$(Agent.TempDirectory)' 'live-cosmos-effective-pom.xml'
-                        & mvn help:effective-pom -Plive-cosmos -pl multiclouddb-conformance `
-                          -DskipTests "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod" `
-                          -Dsurefire.failIfNoSpecifiedTests=false `
-                          "-Dcosmos.endpoint=$endpoint" "-Doutput=$effectivePom"
-                        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $effectivePom)) {
-                          $errors.Add('Maven could not produce the activated live-cosmos effective POM.')
-                        } else {
+                        if ($errors.Count -eq 0) {
+                          $currentProjectBase = (Resolve-Path -LiteralPath `
+                            (Get-Location).Path).Path
+                          if ($currentProjectBase -cne $trustedProjectBase) {
+                            $errors.Add(
+                              'Maven must run from the trusted Build.SourcesDirectory checkout.')
+                          }
+                          foreach ($baseVariable in @(
+                              'MAVEN_PROJECTBASEDIR',
+                              'MAVEN_BASEDIR')) {
+                            $configuredProjectBase = [Environment]::GetEnvironmentVariable(
+                              $baseVariable)
+                            if (-not [string]::IsNullOrWhiteSpace($configuredProjectBase)) {
+                              try {
+                                $resolvedProjectBase = (Resolve-Path -LiteralPath `
+                                  $configuredProjectBase).Path
+                                if ($resolvedProjectBase -cne $trustedProjectBase) {
+                                  $errors.Add(
+                                    "$baseVariable must resolve to Build.SourcesDirectory.")
+                                }
+                              } catch {
+                                $errors.Add(
+                                  "$baseVariable does not resolve to the trusted checkout.")
+                              }
+                            }
+                          }
+                          foreach ($name in $forbiddenOptionVariables) {
+                            $value = [Environment]::GetEnvironmentVariable($name)
+                            if (-not [string]::IsNullOrWhiteSpace($value) `
+                                -and $value -match $forbiddenMavenConfigPattern) {
+                              $errors.Add(
+                                "Environment variable '$name' contains forbidden Maven/JVM injection.")
+                            }
+                          }
+                          foreach ($relativeConfigPath in @(
+                              '.mvn/maven.config',
+                              '.mvn/jvm.config')) {
+                            $configPath = Join-Path $trustedProjectBase $relativeConfigPath
+                            if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+                              Write-Host "Rechecking Maven configuration file: $relativeConfigPath"
+                              $configText = Get-Content -LiteralPath $configPath -Raw
+                              if ($configText -match $forbiddenMavenConfigPattern) {
+                                $errors.Add(
+                                  "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or TLS injection.")
+                              }
+                            }
+                          }
+                          $extensionsPath = Join-Path $trustedProjectBase `
+                            '.mvn/extensions.xml'
+                          if (Test-Path -LiteralPath $extensionsPath) {
+                            $errors.Add(
+                              "Maven core extension file '.mvn/extensions.xml' is not permitted in the live WIF pipeline.")
+                          }
+                        }
+
+                        if ($errors.Count -eq 0) {
+                          $effectivePom = Join-Path '$(Agent.TempDirectory)' `
+                            'live-cosmos-effective-pom.xml'
+                          if (Test-Path -LiteralPath $effectivePom) {
+                            Remove-Item -LiteralPath $effectivePom -Force -ErrorAction Stop
+                          }
+                          $effectivePomOutput = & mvn help:effective-pom -Plive-cosmos `
+                            -pl multiclouddb-conformance `
+                            -DskipTests "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod" `
+                            -Dsurefire.failIfNoSpecifiedTests=false `
+                            "-Dcosmos.endpoint=$endpoint" "-Doutput=$effectivePom" 2>&1
+                          $effectivePomExitCode = $LASTEXITCODE
+                          $effectivePomOutput |
+                            Where-Object {
+                              $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
+                            } |
+                            ForEach-Object { Write-Host $_ }
+                          if ($effectivePomExitCode -ne 0 `
+                              -or -not (Test-Path -LiteralPath $effectivePom)) {
+                            $errors.Add('Maven could not produce the activated live-cosmos effective POM.')
+                          } else {
                           [xml]$effective = Get-Content -LiteralPath $effectivePom -Raw
                           $surefire = @($effective.SelectNodes(
                             "//*[local-name()='project']/*[local-name()='build']/" +
@@ -525,6 +659,7 @@ stages:
                                       }
                                       if ($forbiddenTlsNames -contains $name) {
                                         $injections.Add("$containerName/$name")
+                                        }
                                       }
                                     }
                                   }
@@ -614,30 +749,83 @@ stages:
                         }
                       }
 
+                      $trustedProjectBase = (Resolve-Path -LiteralPath `
+                        '$(Build.SourcesDirectory)').Path
+                      $currentProjectBase = (Resolve-Path -LiteralPath `
+                        (Get-Location).Path).Path
+                      if ($currentProjectBase -cne $trustedProjectBase) {
+                        throw 'Maven must run from the trusted Build.SourcesDirectory checkout.'
+                      }
+
+                      foreach ($baseVariable in @(
+                          'MAVEN_PROJECTBASEDIR',
+                          'MAVEN_BASEDIR')) {
+                        $configuredProjectBase = [Environment]::GetEnvironmentVariable(
+                          $baseVariable)
+                        if (-not [string]::IsNullOrWhiteSpace($configuredProjectBase)) {
+                          try {
+                            $resolvedProjectBase = (Resolve-Path -LiteralPath `
+                              $configuredProjectBase).Path
+                          } catch {
+                            throw "$baseVariable does not resolve to the trusted checkout."
+                          }
+                          if ($resolvedProjectBase -cne $trustedProjectBase) {
+                            throw "$baseVariable must resolve to Build.SourcesDirectory."
+                          }
+                        }
+                      }
+
+                      $forbiddenMavenConfigPattern =
+                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)(?:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s|=)|-(?:s|gs|t|gt)(?:\s|=)|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
                           'JDK_JAVA_OPTIONS',
                           'MAVEN_OPTS',
+                          'MAVEN_DEBUG_OPTS',
                           'MAVEN_ARGS')) {
                         $value = [Environment]::GetEnvironmentVariable($name)
                         if (-not [string]::IsNullOrWhiteSpace($value) `
-                            -and $value -match '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile)(?:\s*=|\s|$)') {
-                          throw "Environment variable '$name' contains forbidden JVM property injection."
+                            -and $value -match $forbiddenMavenConfigPattern) {
+                          throw "Environment variable '$name' contains forbidden Maven/JVM injection."
                         }
+                      }
+
+                      foreach ($relativeConfigPath in @(
+                          '.mvn/maven.config',
+                          '.mvn/jvm.config')) {
+                        $configPath = Join-Path $trustedProjectBase $relativeConfigPath
+                        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+                          Write-Host "Inspecting Maven configuration file: $relativeConfigPath"
+                          $configText = Get-Content -LiteralPath $configPath -Raw
+                          if ($configText -match $forbiddenMavenConfigPattern) {
+                            throw "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or TLS injection."
+                          }
+                        }
+                      }
+                      $extensionsPath = Join-Path $trustedProjectBase '.mvn/extensions.xml'
+                      if (Test-Path -LiteralPath $extensionsPath) {
+                        throw "Maven core extension file '.mvn/extensions.xml' is not permitted in the live WIF pipeline."
                       }
 
                       # This exact future sentinel must perform a real Cosmos data-plane
                       # operation using DefaultAzureCredential and fail (never skip) if
                       # endpoint, Azure CLI auth, RBAC, or fixtures are unavailable.
-                      mvn verify -Plive-cosmos -pl multiclouddb-conformance -am `
+                      $verifyOutput = & mvn verify -Plive-cosmos `
+                        -pl multiclouddb-conformance -am `
                         "-Dtest=LiveCosmosEntraAuthenticationTest#entraAuthenticationPerformsCreateReadDelete" `
                         -Dsurefire.failIfNoSpecifiedTests=false `
                         "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT" `
                         -Djunit.jupiter.execution.timeout.default=60s `
-                        -DtrimStackTrace=false
-                      if ($LASTEXITCODE -ne 0) {
-                        throw "Live Cosmos DB tests failed with Maven exit code $LASTEXITCODE."
+                        -DtrimStackTrace=false 2>&1
+                      $verifyExitCode = $LASTEXITCODE
+                      $verifyOutput |
+                        Where-Object {
+                          $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
+                        } |
+                        ForEach-Object { Write-Host $_ }
+                      if ($verifyExitCode -ne 0) {
+                        throw "Live Cosmos DB tests failed with Maven exit code $verifyExitCode."
                       }
                   env:
                     # Deliberately pass no account key or client secret.
@@ -680,7 +868,7 @@ stages:
                       $cases = @($result.SelectNodes(
                         "//testcase[" +
                         "@classname='com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest' and " +
-                        "@name='$sentinelMethod']"))
+                        "(@name='$sentinelMethod' or @name='$sentinelMethod()')]"))
                       $total = 0
                       $failed = 0
                       $skipped = 0
