@@ -55,6 +55,26 @@ stages:
                   fetchDepth: 1
                   persistCredentials: false
 
+                - task: PowerShell@2
+                  displayName: Remove stale test results
+                  condition: always()
+                  inputs:
+                    targetType: inline
+                    pwsh: true
+                    script: |
+                      $ErrorActionPreference = 'Stop'
+                      $reportDirectory = Join-Path '$(Build.SourcesDirectory)' `
+                        'multiclouddb-conformance/target/surefire-reports'
+                      $sentinelReport = Join-Path $reportDirectory `
+                        'TEST-com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest.xml'
+                      if (Test-Path -LiteralPath $reportDirectory) {
+                        Remove-Item -LiteralPath $reportDirectory -Recurse -Force -ErrorAction Stop
+                      }
+                      if ((Test-Path -LiteralPath $reportDirectory) `
+                          -or (Test-Path -LiteralPath $sentinelReport)) {
+                        throw 'Stale live Cosmos DB test results could not be removed.'
+                      }
+
                 - task: JavaToolInstaller@0
                   displayName: Use Java 17
                   inputs:
@@ -185,13 +205,16 @@ stages:
                           $errors.Add(@'
                       The required Maven profile 'live-cosmos' does not exist or did not activate.
                       Add it with a dedicated com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
-                      sentinel method named entraAuthenticationPerformsCreateReadDelete. That test
-                      must construct a live-specific MulticloudDbClientConfig whose only connection
-                      setting is System.getProperty("cosmos.endpoint"), with no key/auth entries; it
-                      must not call ConformanceConfig.forProvider(COSMOS), which defaults to the
-                      emulator key. The profile must omit credential and endpoint injection, require
-                      cosmos.endpoint, use DefaultAzureCredential, fail rather than skip when
-                      prerequisites are absent, and isolate/clean up run-scoped fixtures.
+                      sentinel method named entraAuthenticationPerformsCreateReadDelete. Use a
+                      standalone final class with no class/extension annotations, inheritance,
+                      lifecycle hooks, fields, helper members, or extra method annotations. The test
+                      must construct a live-specific MulticloudDbClientConfig whose
+                      only connection setting is System.getProperty("cosmos.endpoint"), with no
+                      key/auth entries; it must not call ConformanceConfig.forProvider(COSMOS), which
+                      defaults to the emulator key. Create the client in try-with-resources, delete
+                      the run-scoped item in finally, and fail rather than skip when endpoint, Azure
+                      CLI authentication, RBAC, or fixtures are unavailable. The profile must omit
+                      credential and endpoint injection and require cosmos.endpoint.
                       '@
                           )
                         }
@@ -325,7 +348,7 @@ stages:
 
                           $sentinelStructure = Get-JavaStructuralText $sentinelText
                           $classPattern =
-                            '\b(?:public\s+)?(?:final\s+)?class\s+LiveCosmosEntraAuthenticationTest\b[^{]*\{'
+                            '\bpublic\s+final\s+class\s+LiveCosmosEntraAuthenticationTest\s*\{'
                           $classMatch = $null
                           foreach ($candidate in [regex]::Matches(
                               $sentinelStructure, $classPattern)) {
@@ -336,12 +359,21 @@ stages:
                           }
                           $classStructure = ''
                           $classBodyStart = -1
+                          $classHasAnnotations = $false
+                          if ($null -ne $classMatch) {
+                            $classPrefix = $sentinelStructure.Substring(
+                              0, $classMatch.Index)
+                            $classHasAnnotations =
+                              $classPrefix -match '(?m)^\s*@'
+                          }
                           if ($null -eq $classMatch `
+                              -or $classHasAnnotations `
                               -or $sentinelStructure -notmatch
                                 '(?m)^\s*package\s+com\.multiclouddb\.conformance\s*;') {
                             $errors.Add(@'
                       The sentinel source must declare the top-level
-                      com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest class.
+                      public final com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
+                      class without class annotations, inheritance, or implemented interfaces.
                       '@
                       )
                           } else {
@@ -354,12 +386,15 @@ stages:
                           if ($classStructure -match '\bConformanceConfig\b' `
                               -or $classStructure -match
                                 '\b(?:CosmosConstants\s*\.\s*)?CONFIG_KEY\b' `
+                              -or $classStructure -match
+                                '\bConformanceHarness\s*\.\s*createClient\s*\(' `
                               -or $classStructure -match '\.\s*key\s*\(' `
                               -or $classStructure -match '\.\s*auth\s*\(') {
                             $errors.Add(@'
-                      LiveCosmosEntraAuthenticationTest references ConformanceConfig or a key/auth
-                      configuration API. Build a live-specific MulticloudDbClientConfig with only
-                      the pipeline-supplied endpoint so DefaultAzureCredential is selected.
+                      LiveCosmosEntraAuthenticationTest references ConformanceConfig,
+                      ConformanceHarness.createClient, or a key/auth configuration API. Build a
+                      live-specific MulticloudDbClientConfig with only the pipeline-supplied
+                      endpoint so DefaultAzureCredential is selected.
                       '@
                       )
                           }
@@ -368,7 +403,7 @@ stages:
                               'LiveCosmosEntraAuthenticationTest must not declare @DisplayName; use the exact default method name.')
                           }
 
-                          $methodPattern = "(?s)@Test\s+(?:@\w+(?:\([^)]*\))?\s+)*(?:public\s+)?void\s+$sentinelMethod\s*\(\s*\)(?:\s+throws\s+[\w.,\s]+)?\s*\{"
+                          $methodPattern = "(?s)@Test\s+(?:public\s+)?void\s+$sentinelMethod\s*\(\s*\)(?:\s+throws\s+[\w.,\s]+)?\s*\{"
                           $methodMatch = $null
                           foreach ($candidate in [regex]::Matches(
                               $classStructure, $methodPattern)) {
@@ -394,6 +429,24 @@ stages:
                               $bodyStart = $classBodyStart + $bodyStartInClass
                               $sentinelMethodCode = $sentinelText.Substring(
                                 $bodyStart, $sentinelMethodStructure.Length)
+                              $methodEndInClass =
+                                $bodyStartInClass + $sentinelMethodStructure.Length
+                              $membersBeforeMethod = $classStructure.Substring(
+                                1, $methodMatch.Index - 1)
+                              $membersAfterMethod = $classStructure.Substring(
+                                $methodEndInClass,
+                                $classStructure.Length - $methodEndInClass - 1)
+                              if (-not [string]::IsNullOrWhiteSpace(
+                                  $membersBeforeMethod + $membersAfterMethod)) {
+                                $errors.Add(@'
+                      LiveCosmosEntraAuthenticationTest must be a self-contained sentinel whose
+                      only class member is entraAuthenticationPerformsCreateReadDelete. Fields,
+                      constructors, helper methods, nested types, additional tests, and JUnit
+                      lifecycle hooks are not permitted; code review must assess any future
+                      expansion rather than relying on this source gate.
+                      '@
+                      )
+                              }
                             }
                           }
 
@@ -436,14 +489,19 @@ stages:
                                 'one endpoint-only connection bound directly to System.getProperty("cosmos.endpoint") and no auth settings')
                             }
 
+                            $factoryCallPattern =
+                              '\bMulticloudDbClientFactory\s*\.\s*create\s*\('
                             $clientMatch = [regex]::Match(
                               $sentinelMethodStructure,
-                              "(?s)\b(?:var|MulticloudDbClient)\s+(?<client>\w+)\s*=\s*MulticloudDbClientFactory\s*\.\s*create\s*\(\s*$configName\s*\)")
+                              "(?s)\btry\s*\(\s*(?:var|MulticloudDbClient)\s+(?<client>\w+)\s*=\s*MulticloudDbClientFactory\s*\.\s*create\s*\(\s*$configName\s*\)\s*;?\s*\)\s*\{")
                             if (-not $clientMatch.Success `
                                 -or (Get-JavaBraceDepth `
-                                  $sentinelMethodStructure $clientMatch.Index) -ne 1) {
+                                  $sentinelMethodStructure $clientMatch.Index) -ne 1 `
+                                -or @([regex]::Matches(
+                                  $sentinelMethodStructure,
+                                  $factoryCallPattern)).Count -ne 1) {
                               $missingContract.Add(
-                                'method-level factory client created from that config')
+                                'one method-level factory client created from that config in try-with-resources')
                             } else {
                               $clientName = [regex]::Escape($clientMatch.Groups['client'].Value)
                               if (@([regex]::Matches(
@@ -453,9 +511,17 @@ stages:
                                     "\b$clientName\s*[+\-*/]=") {
                                 $missingContract.Add('a factory client variable that is never reassigned')
                               }
+                              $clientBodyStart = $sentinelMethodStructure.IndexOf(
+                                  '{', $clientMatch.Index)
+                              $clientScope = Get-BalancedJavaBlock `
+                                  $sentinelMethodStructure $clientBodyStart
+                              if ([string]::IsNullOrWhiteSpace($clientScope)) {
+                                  $missingContract.Add(
+                                    'a balanced try-with-resources client scope')
+                              }
                               $keyMatch = [regex]::Match(
-                                $sentinelMethodStructure,
-                                '(?s)\b(?:var|MulticloudDbKey)\s+(?<key>\w+)\s*=\s*ConformanceHarness\s*\.\s*uniqueKey\s*\(')
+                                  $sentinelMethodStructure,
+                                  '(?s)\b(?:var|MulticloudDbKey)\s+(?<key>\w+)\s*=\s*ConformanceHarness\s*\.\s*uniqueKey\s*\(')
                               if (-not $keyMatch.Success `
                                   -or (Get-JavaBraceDepth `
                                     $sentinelMethodStructure $keyMatch.Index) -ne 1) {
@@ -473,22 +539,22 @@ stages:
 
                                 $protectedFlow = $false
                                 foreach ($tryMatch in [regex]::Matches(
-                                    $sentinelMethodStructure, '\btry\s*\{')) {
-                                  $tryStart = $sentinelMethodStructure.IndexOf(
+                                    $clientScope, '\btry\s*\{')) {
+                                  $tryStart = $clientScope.IndexOf(
                                     '{', $tryMatch.Index)
                                   $tryBody = Get-BalancedJavaBlock `
-                                    $sentinelMethodStructure $tryStart
+                                    $clientScope $tryStart
                                   if ([string]::IsNullOrWhiteSpace($tryBody)) { continue }
 
                                   $afterTry = $tryStart + $tryBody.Length
-                                  $afterTryText = $sentinelMethodStructure.Substring($afterTry)
+                                  $afterTryText = $clientScope.Substring($afterTry)
                                   $finallyMatch = [regex]::Match(
                                     $afterTryText, '^\s*finally\s*\{')
                                   if (-not $finallyMatch.Success) { continue }
                                   $finallyStart = $afterTry + $afterTryText.IndexOf(
                                     '{', $finallyMatch.Index)
                                   $finallyBody = Get-BalancedJavaBlock `
-                                    $sentinelMethodStructure $finallyStart
+                                    $clientScope $finallyStart
 
                                   $tryStatements = $tryBody.Substring(
                                     1, $tryBody.Length - 2)
@@ -533,8 +599,11 @@ stages:
                       contract elements: $(($missingContract -join ', ')). The exact method must
                       directly bind its sole endpoint to System.getProperty("cosmos.endpoint"),
                       configure no key/auth entries, create/read/verify/delete a run-scoped item,
-                      and delete in finally. These checks reject trivial sentinels; code review must
-                      still confirm the live operation and cleanup semantics.
+                      delete in finally, and guarantee client close with try-with-resources even
+                      when delete fails. The final class must contain no class/extension annotations,
+                      inheritance, lifecycle hooks, fields, helper members, or extra method
+                      annotations. These checks reject known unsafe/trivial sentinels; code review
+                      must still confirm live operation and cleanup semantics.
                       "@
                       )
                           }
@@ -601,10 +670,12 @@ stages:
                           if (Test-Path -LiteralPath $effectivePom) {
                             Remove-Item -LiteralPath $effectivePom -Force -ErrorAction Stop
                           }
+                          # Keep dotted -D arguments quoted. PowerShell otherwise
+                          # splits them before Maven receives the complete option.
                           $effectivePomOutput = & mvn help:effective-pom -Plive-cosmos `
                             -pl multiclouddb-conformance `
-                            -DskipTests "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod" `
-                            -Dsurefire.failIfNoSpecifiedTests=false `
+                            '-DskipTests' "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod" `
+                            '-Dsurefire.failIfNoSpecifiedTests=false' `
                             "-Dcosmos.endpoint=$endpoint" "-Doutput=$effectivePom" 2>&1
                           $effectivePomExitCode = $LASTEXITCODE
                           $effectivePomOutput |
@@ -703,25 +774,6 @@ stages:
                   env:
                     COSMOS_ENDPOINT: $(COSMOS_ENDPOINT)
 
-                - task: PowerShell@2
-                  displayName: Remove stale test results
-                  inputs:
-                    targetType: inline
-                    pwsh: true
-                    script: |
-                      $ErrorActionPreference = 'Stop'
-                      $reportDirectory = Join-Path '$(Build.SourcesDirectory)' `
-                        'multiclouddb-conformance/target/surefire-reports'
-                      $sentinelReport = Join-Path $reportDirectory `
-                        'TEST-com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest.xml'
-                      if (Test-Path -LiteralPath $reportDirectory) {
-                        Remove-Item -LiteralPath $reportDirectory -Recurse -Force -ErrorAction Stop
-                      }
-                      if ((Test-Path -LiteralPath $reportDirectory) `
-                          -or (Test-Path -LiteralPath $sentinelReport)) {
-                        throw 'Stale live Cosmos DB test results could not be removed.'
-                      }
-
                 - task: AzureCLI@2
                   displayName: Run live Cosmos DB tests with WIF
                   inputs:
@@ -811,13 +863,15 @@ stages:
                       # This exact future sentinel must perform a real Cosmos data-plane
                       # operation using DefaultAzureCredential and fail (never skip) if
                       # endpoint, Azure CLI auth, RBAC, or fixtures are unavailable.
+                      # Keep dotted -D arguments quoted so PowerShell passes each
+                      # complete option to Maven.
                       $verifyOutput = & mvn verify -Plive-cosmos `
                         -pl multiclouddb-conformance -am `
                         "-Dtest=LiveCosmosEntraAuthenticationTest#entraAuthenticationPerformsCreateReadDelete" `
-                        -Dsurefire.failIfNoSpecifiedTests=false `
+                        '-Dsurefire.failIfNoSpecifiedTests=false' `
                         "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT" `
-                        -Djunit.jupiter.execution.timeout.default=60s `
-                        -DtrimStackTrace=false 2>&1
+                        '-Djunit.jupiter.execution.timeout.default=60s' `
+                        '-DtrimStackTrace=false' 2>&1
                       $verifyExitCode = $LASTEXITCODE
                       $verifyOutput |
                         Where-Object {
