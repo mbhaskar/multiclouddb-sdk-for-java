@@ -136,7 +136,8 @@ stages:
                       emulator key. The profile must omit credential and endpoint injection, require
                       cosmos.endpoint, use DefaultAzureCredential, fail rather than skip when
                       prerequisites are absent, and isolate/clean up run-scoped fixtures.
-                      '@)
+                      '@
+                      )
                       }
 
                       if ($errors.Count -eq 0) {
@@ -148,7 +149,8 @@ stages:
                       The required LiveCosmosEntraAuthenticationTest source file does not exist.
                       It must define entraAuthenticationPerformsCreateReadDelete as the reviewed
                       live Entra create/read/delete contract.
-                      '@)
+                      '@
+                      )
                         } else {
                           $sentinelText = Get-Content -LiteralPath $sentinelSource -Raw
                           if ($sentinelText -match '\\u+[0-9A-Fa-f]{4}') {
@@ -283,7 +285,8 @@ stages:
                             $errors.Add(@'
                       The sentinel source must declare the top-level
                       com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest class.
-                      '@)
+                      '@
+                      )
                           } else {
                             $classBodyStart = $sentinelStructure.IndexOf(
                               '{', $classMatch.Index)
@@ -299,7 +302,8 @@ stages:
                       LiveCosmosEntraAuthenticationTest references ConformanceConfig or a key-based
                       client configuration API. Build a live-specific MulticloudDbClientConfig with
                       endpoint only so DefaultAzureCredential is selected.
-                      '@)
+                      '@
+                      )
                           }
 
                           $methodPattern = "(?s)@Test\s+(?:@\w+(?:\([^)]*\))?\s+)*(?:public\s+)?void\s+$sentinelMethod\s*\(\s*\)(?:\s+throws\s+[\w.,\s]+)?\s*\{"
@@ -465,7 +469,8 @@ stages:
                       directly build an endpoint-only Cosmos config, create/read/verify/delete a
                       run-scoped item, and delete in finally. These checks reject trivial sentinels;
                       code review must still confirm the live operation and cleanup semantics.
-                      "@)
+                      "@
+                      )
                           }
                         }
 
@@ -487,7 +492,8 @@ stages:
                       The activated effective POM contains no maven-surefire-plugin configuration.
                       The live profile must own an inspectable Surefire configuration for the
                       LiveCosmosEntraAuthenticationTest sentinel.
-                      '@)
+                      '@
+                      )
                           } else {
                             $forbiddenNames = @('cosmos.key', 'cosmos.endpoint', 'COSMOS_KEY', 'COSMOS_ENDPOINT')
                             $forbiddenTlsNames = @(
@@ -546,7 +552,8 @@ stages:
                       injection in its own build/plugins, which a root-POM profile cannot override.
                       Declare live-cosmos in multiclouddb-conformance/pom.xml and replace that
                       configuration with combine.self='override', or safely relocate emulator injection.
-                      "@)
+                      "@
+                      )
                             }
                           }
                         }
