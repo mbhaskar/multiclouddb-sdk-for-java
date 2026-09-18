@@ -130,40 +130,348 @@ stages:
                         $errors.Add(@'
                       The required Maven profile 'live-cosmos' does not exist or did not activate.
                       Add it with a dedicated com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
-                      sentinel. That test must construct a live-specific MulticloudDbClientConfig
-                      with no key entry; it must not call ConformanceConfig.forProvider(COSMOS),
-                      which defaults to the emulator key. The profile must omit credential and
-                      endpoint injection, require cosmos.endpoint, use DefaultAzureCredential,
-                      fail rather than skip when prerequisites are absent, and isolate/clean up
-                      run-scoped fixtures.
+                      sentinel method named entraAuthenticationPerformsCreateReadDelete. That test
+                      must construct a live-specific MulticloudDbClientConfig with no key entry; it
+                      must not call ConformanceConfig.forProvider(COSMOS), which defaults to the
+                      emulator key. The profile must omit credential and endpoint injection, require
+                      cosmos.endpoint, use DefaultAzureCredential, fail rather than skip when
+                      prerequisites are absent, and isolate/clean up run-scoped fixtures.
                       '@)
                       }
 
                       if ($errors.Count -eq 0) {
+                        $sentinelMethod = 'entraAuthenticationPerformsCreateReadDelete'
                         $sentinelSource = Join-Path '$(Build.SourcesDirectory)' `
                           'multiclouddb-conformance/src/test/java/com/multiclouddb/conformance/LiveCosmosEntraAuthenticationTest.java'
                         if (-not (Test-Path -LiteralPath $sentinelSource -PathType Leaf)) {
                           $errors.Add(@'
                       The required LiveCosmosEntraAuthenticationTest source file does not exist.
-                      It must perform a real Entra-authenticated Cosmos data-plane operation.
+                      It must define entraAuthenticationPerformsCreateReadDelete as the reviewed
+                      live Entra create/read/delete contract.
                       '@)
                         } else {
                           $sentinelText = Get-Content -LiteralPath $sentinelSource -Raw
-                          if ($sentinelText -match '\bConformanceConfig\b' `
-                              -or $sentinelText -match '\.connection\s*\(\s*"key"' `
-                              -or $sentinelText -match '\b(?:CosmosConstants\s*\.\s*)?CONFIG_KEY\b' `
-                              -or $sentinelText -match '\.key\s*\(') {
+                          if ($sentinelText -match '\\u+[0-9A-Fa-f]{4}') {
+                            $errors.Add(
+                              'LiveCosmosEntraAuthenticationTest must not contain Java Unicode escapes.')
+                          }
+                          function Get-JavaStructuralText {
+                            param([string]$Source)
+                            $output = [char[]](' ' * $Source.Length)
+                            $state = 'code'
+                            for ($index = 0; $index -lt $Source.Length; $index++) {
+                              $character = $Source[$index]
+                              $next = if ($index + 1 -lt $Source.Length) {
+                                $Source[$index + 1]
+                              } else { [char]0 }
+                              $afterNext = if ($index + 2 -lt $Source.Length) {
+                                $Source[$index + 2]
+                              } else { [char]0 }
+
+                              if ($character -eq "`r" -or $character -eq "`n") {
+                                $output[$index] = $character
+                                if ($state -eq 'lineComment') { $state = 'code' }
+                                continue
+                              }
+                              if ($state -eq 'lineComment') { continue }
+                              if ($state -eq 'blockComment') {
+                                if ($character -eq '*' -and $next -eq '/') {
+                                  $state = 'code'
+                                  $index++
+                                }
+                                continue
+                              }
+                              if ($state -eq 'string') {
+                                if ($character -eq '\') {
+                                  $index++
+                                } elseif ($character -eq '"') {
+                                  $state = 'code'
+                                }
+                                continue
+                              }
+                              if ($state -eq 'character') {
+                                if ($character -eq '\') {
+                                  $index++
+                                } elseif ($character -eq "'") {
+                                  $state = 'code'
+                                }
+                                continue
+                              }
+                              if ($state -eq 'textBlock') {
+                                if ($character -eq '"' -and $next -eq '"' -and
+                                    $afterNext -eq '"' -and
+                                    ($index -eq 0 -or $Source[$index - 1] -ne '\')) {
+                                  $state = 'code'
+                                  $index += 2
+                                }
+                                continue
+                              }
+
+                              if ($character -eq '/' -and $next -eq '/') {
+                                $state = 'lineComment'
+                                $index++
+                              } elseif ($character -eq '/' -and $next -eq '*') {
+                                $state = 'blockComment'
+                                $index++
+                              } elseif ($character -eq '"' -and $next -eq '"' -and
+                                  $afterNext -eq '"') {
+                                $state = 'textBlock'
+                                $index += 2
+                              } elseif ($character -eq '"') {
+                                $state = 'string'
+                              } elseif ($character -eq "'") {
+                                $state = 'character'
+                              } else {
+                                $output[$index] = $character
+                              }
+                            }
+                            return -join $output
+                          }
+
+                          function Get-BalancedJavaBlock {
+                            param(
+                              [string]$Structure,
+                              [int]$OpenBraceIndex
+                            )
+                            $depth = 0
+                            for ($index = $OpenBraceIndex; $index -lt $Structure.Length; $index++) {
+                              if ($Structure[$index] -eq '{') {
+                                $depth++
+                              } elseif ($Structure[$index] -eq '}') {
+                                $depth--
+                                if ($depth -eq 0) {
+                                  return $Structure.Substring(
+                                    $OpenBraceIndex, $index - $OpenBraceIndex + 1)
+                                }
+                              }
+                            }
+                            return ''
+                          }
+
+                          function Get-JavaBraceDepth {
+                            param(
+                              [string]$Structure,
+                              [int]$Position
+                            )
+                            $depth = 0
+                            for ($index = 0; $index -lt $Position; $index++) {
+                              if ($Structure[$index] -eq '{') {
+                                $depth++
+                              } elseif ($Structure[$index] -eq '}') {
+                                $depth--
+                              }
+                            }
+                            return $depth
+                          }
+
+                          $sentinelStructure = Get-JavaStructuralText $sentinelText
+                          $classPattern =
+                            '\b(?:public\s+)?(?:final\s+)?class\s+LiveCosmosEntraAuthenticationTest\b[^{]*\{'
+                          $classMatch = $null
+                          foreach ($candidate in [regex]::Matches(
+                              $sentinelStructure, $classPattern)) {
+                            if ((Get-JavaBraceDepth $sentinelStructure $candidate.Index) -eq 0) {
+                              $classMatch = $candidate
+                              break
+                            }
+                          }
+                          $classStructure = ''
+                          $classBodyStart = -1
+                          if ($null -eq $classMatch `
+                              -or $sentinelStructure -notmatch
+                                '(?m)^\s*package\s+com\.multiclouddb\.conformance\s*;') {
+                            $errors.Add(@'
+                      The sentinel source must declare the top-level
+                      com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest class.
+                      '@)
+                          } else {
+                            $classBodyStart = $sentinelStructure.IndexOf(
+                              '{', $classMatch.Index)
+                            $classStructure = Get-BalancedJavaBlock `
+                              $sentinelStructure $classBodyStart
+                          }
+
+                          if ($classStructure -match '\bConformanceConfig\b' `
+                              -or $classStructure -match
+                                '\b(?:CosmosConstants\s*\.\s*)?CONFIG_KEY\b' `
+                              -or $classStructure -match '\.\s*key\s*\(') {
                             $errors.Add(@'
                       LiveCosmosEntraAuthenticationTest references ConformanceConfig or a key-based
                       client configuration API. Build a live-specific MulticloudDbClientConfig with
                       endpoint only so DefaultAzureCredential is selected.
                       '@)
                           }
+
+                          $methodPattern = "(?s)@Test\s+(?:@\w+(?:\([^)]*\))?\s+)*(?:public\s+)?void\s+$sentinelMethod\s*\(\s*\)(?:\s+throws\s+[\w.,\s]+)?\s*\{"
+                          $methodMatch = $null
+                          foreach ($candidate in [regex]::Matches(
+                              $classStructure, $methodPattern)) {
+                            if ((Get-JavaBraceDepth $classStructure $candidate.Index) -eq 1) {
+                              $methodMatch = $candidate
+                              break
+                            }
+                          }
+                          $sentinelMethodCode = ''
+                          $sentinelMethodStructure = ''
+                          if ($null -eq $methodMatch) {
+                            $errors.Add(
+                              "LiveCosmosEntraAuthenticationTest must define the exact @Test method '$sentinelMethod'.")
+                          } else {
+                            $bodyStartInClass = $classStructure.IndexOf(
+                              '{', $methodMatch.Index)
+                            $sentinelMethodStructure = Get-BalancedJavaBlock `
+                              $classStructure $bodyStartInClass
+                            if ([string]::IsNullOrWhiteSpace($sentinelMethodStructure)) {
+                              $errors.Add(
+                                "Could not inspect the body of LiveCosmosEntraAuthenticationTest#$sentinelMethod.")
+                            } else {
+                              $bodyStart = $classBodyStart + $bodyStartInClass
+                              $sentinelMethodCode = $sentinelText.Substring(
+                                $bodyStart, $sentinelMethodStructure.Length)
+                            }
+                          }
+
+                          $missingContract = [System.Collections.Generic.List[string]]::new()
+                          if ($sentinelMethodStructure -match
+                              '(?:\b(?:catch|if|else|for|while|do|switch|synchronized)\b|\bassertDoesNotThrow\s*\(|->)') {
+                            $missingContract.Add(
+                              'no conditional, loop, catch, synchronized, assertDoesNotThrow, or lambda wrappers')
+                          }
+                          $configMatch = [regex]::Match(
+                            $sentinelMethodStructure,
+                            '(?s)\b(?:var|MulticloudDbClientConfig)\s+(?<config>\w+)\s*=\s*MulticloudDbClientConfig\s*\.\s*builder\s*\(\s*\)(?<chain>[^;]*)\.\s*build\s*\(\s*\)\s*;')
+                          if (-not $configMatch.Success `
+                              -or (Get-JavaBraceDepth `
+                                $sentinelMethodStructure $configMatch.Index) -ne 1) {
+                            $missingContract.Add(
+                              'direct method-level MulticloudDbClientConfig construction')
+                          } else {
+                            $configName = [regex]::Escape($configMatch.Groups['config'].Value)
+                            if (@([regex]::Matches(
+                                $sentinelMethodStructure,
+                                "\b$configName\s*=(?!=)")).Count -ne 1 `
+                                -or $sentinelMethodStructure -match
+                                  "\b$configName\s*[+\-*/]=") {
+                              $missingContract.Add('a config variable that is never reassigned')
+                            }
+                            $configCode = $sentinelMethodCode.Substring(
+                              $configMatch.Index, $configMatch.Length)
+                            if ($configMatch.Groups['chain'].Value -notmatch
+                                '\.\s*provider\s*\(\s*ProviderId\s*\.\s*COSMOS\s*\)') {
+                              $missingContract.Add('ProviderId.COSMOS selection')
+                            }
+                            if ($configCode -notmatch
+                                '\.\s*connection\s*\(\s*(?:"endpoint"|(?:CosmosConstants\s*\.\s*)?CONFIG_ENDPOINT)\s*,' `
+                                -or @([regex]::Matches(
+                                  $configCode, '\.\s*connection\s*\(')).Count -ne 1) {
+                              $missingContract.Add('one endpoint-only connection setting')
+                            }
+
+                            $clientMatch = [regex]::Match(
+                              $sentinelMethodStructure,
+                              "(?s)\b(?:var|MulticloudDbClient)\s+(?<client>\w+)\s*=\s*MulticloudDbClientFactory\s*\.\s*create\s*\(\s*$configName\s*\)")
+                            if (-not $clientMatch.Success `
+                                -or (Get-JavaBraceDepth `
+                                  $sentinelMethodStructure $clientMatch.Index) -ne 1) {
+                              $missingContract.Add(
+                                'method-level factory client created from that config')
+                            } else {
+                              $clientName = [regex]::Escape($clientMatch.Groups['client'].Value)
+                              if (@([regex]::Matches(
+                                  $sentinelMethodStructure,
+                                  "\b$clientName\s*=(?!=)")).Count -ne 1 `
+                                  -or $sentinelMethodStructure -match
+                                    "\b$clientName\s*[+\-*/]=") {
+                                $missingContract.Add('a factory client variable that is never reassigned')
+                              }
+                              $keyMatch = [regex]::Match(
+                                $sentinelMethodStructure,
+                                '(?s)\b(?:var|MulticloudDbKey)\s+(?<key>\w+)\s*=\s*ConformanceHarness\s*\.\s*uniqueKey\s*\(')
+                              if (-not $keyMatch.Success `
+                                  -or (Get-JavaBraceDepth `
+                                    $sentinelMethodStructure $keyMatch.Index) -ne 1) {
+                                $missingContract.Add(
+                                  'a method-level ConformanceHarness.uniqueKey run-scoped key')
+                              } else {
+                                $keyName = [regex]::Escape($keyMatch.Groups['key'].Value)
+                                if (@([regex]::Matches(
+                                    $sentinelMethodStructure,
+                                    "\b$keyName\s*=(?!=)")).Count -ne 1 `
+                                    -or $sentinelMethodStructure -match
+                                      "\b$keyName\s*[+\-*/]=") {
+                                  $missingContract.Add('a run-scoped key variable that is never reassigned')
+                                }
+
+                                $protectedFlow = $false
+                                foreach ($tryMatch in [regex]::Matches(
+                                    $sentinelMethodStructure, '\btry\s*\{')) {
+                                  $tryStart = $sentinelMethodStructure.IndexOf(
+                                    '{', $tryMatch.Index)
+                                  $tryBody = Get-BalancedJavaBlock `
+                                    $sentinelMethodStructure $tryStart
+                                  if ([string]::IsNullOrWhiteSpace($tryBody)) { continue }
+
+                                  $afterTry = $tryStart + $tryBody.Length
+                                  $afterTryText = $sentinelMethodStructure.Substring($afterTry)
+                                  $finallyMatch = [regex]::Match(
+                                    $afterTryText, '^\s*finally\s*\{')
+                                  if (-not $finallyMatch.Success) { continue }
+                                  $finallyStart = $afterTry + $afterTryText.IndexOf(
+                                    '{', $finallyMatch.Index)
+                                  $finallyBody = Get-BalancedJavaBlock `
+                                    $sentinelMethodStructure $finallyStart
+
+                                  $tryStatements = $tryBody.Substring(
+                                    1, $tryBody.Length - 2)
+                                  $finallyStatements = $finallyBody.Substring(
+                                    1, $finallyBody.Length - 2)
+                                  $wrappedFlowPattern =
+                                    '(?:[{}]|->|\b(?:if|else|for|while|do|switch|try|catch|synchronized)\b)'
+                                  if ($tryStatements -match $wrappedFlowPattern `
+                                      -or $finallyStatements -match $wrappedFlowPattern) {
+                                    continue
+                                  }
+
+                                  $createPattern =
+                                    "(?s)\b$clientName\s*\.\s*create\s*\(\s*[^,;]+\s*,\s*$keyName\s*,"
+                                  $readPattern =
+                                    "(?s)\b(?:var|DocumentResult)\s+(?<result>\w+)\s*=\s*$clientName\s*\.\s*read\s*\(\s*[^,;]+\s*,\s*$keyName\s*(?:,|\))"
+                                  $readMatch = [regex]::Match($tryBody, $readPattern)
+                                  $deletePattern =
+                                    "(?s)\b$clientName\s*\.\s*delete\s*\(\s*[^,;]+\s*,\s*$keyName\s*(?:,|\))"
+                                  if ($tryBody -match $createPattern `
+                                      -and $readMatch.Success `
+                                      -and $finallyBody -match $deletePattern) {
+                                    $readResultName = [regex]::Escape(
+                                      $readMatch.Groups['result'].Value)
+                                    if ($tryBody -match
+                                        "(?s)\bassertNotNull\s*\(\s*$readResultName\s*\)") {
+                                      $protectedFlow = $true
+                                      break
+                                    }
+                                  }
+                                }
+                                if (-not $protectedFlow) {
+                                  $missingContract.Add(
+                                    'create/read/assertNotNull protected by the finally that deletes the same client/key')
+                                }
+                              }
+                            }
+                          }
+                          if ($missingContract.Count -ne 0) {
+                            $errors.Add(@"
+                      LiveCosmosEntraAuthenticationTest#$sentinelMethod is missing required source
+                      contract elements: $(($missingContract -join ', ')). The exact method must
+                      directly build an endpoint-only Cosmos config, create/read/verify/delete a
+                      run-scoped item, and delete in finally. These checks reject trivial sentinels;
+                      code review must still confirm the live operation and cleanup semantics.
+                      "@)
+                          }
                         }
 
                         $effectivePom = Join-Path '$(Agent.TempDirectory)' 'live-cosmos-effective-pom.xml'
                         & mvn help:effective-pom -Plive-cosmos -pl multiclouddb-conformance `
-                          -DskipTests -Dtest=LiveCosmosEntraAuthenticationTest `
+                          -DskipTests "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod" `
                           -Dsurefire.failIfNoSpecifiedTests=false `
                           "-Dcosmos.endpoint=$endpoint" "-Doutput=$effectivePom"
                         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $effectivePom)) {
@@ -259,8 +567,18 @@ stages:
                     targetType: inline
                     pwsh: true
                     script: |
-                      Get-ChildItem '$(Build.SourcesDirectory)' -Recurse -Directory -Filter surefire-reports `
-                        -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+                      $ErrorActionPreference = 'Stop'
+                      $reportDirectory = Join-Path '$(Build.SourcesDirectory)' `
+                        'multiclouddb-conformance/target/surefire-reports'
+                      $sentinelReport = Join-Path $reportDirectory `
+                        'TEST-com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest.xml'
+                      if (Test-Path -LiteralPath $reportDirectory) {
+                        Remove-Item -LiteralPath $reportDirectory -Recurse -Force -ErrorAction Stop
+                      }
+                      if ((Test-Path -LiteralPath $reportDirectory) `
+                          -or (Test-Path -LiteralPath $sentinelReport)) {
+                        throw 'Stale live Cosmos DB test results could not be removed.'
+                      }
 
                 - task: AzureCLI@2
                   displayName: Run live Cosmos DB tests with WIF
@@ -306,7 +624,7 @@ stages:
                       # operation using DefaultAzureCredential and fail (never skip) if
                       # endpoint, Azure CLI auth, RBAC, or fixtures are unavailable.
                       mvn verify -Plive-cosmos -pl multiclouddb-conformance -am `
-                        -Dtest=LiveCosmosEntraAuthenticationTest `
+                        "-Dtest=LiveCosmosEntraAuthenticationTest#entraAuthenticationPerformsCreateReadDelete" `
                         -Dsurefire.failIfNoSpecifiedTests=false `
                         "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT" `
                         -Djunit.jupiter.execution.timeout.default=60s `
@@ -351,8 +669,11 @@ stages:
                       }
 
                       [xml]$result = Get-Content -LiteralPath $report -Raw
+                      $sentinelMethod = 'entraAuthenticationPerformsCreateReadDelete'
                       $cases = @($result.SelectNodes(
-                        "//testcase[@classname='com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest']"))
+                        "//testcase[" +
+                        "@classname='com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest' and " +
+                        "@name='$sentinelMethod']"))
                       $total = 0
                       $failed = 0
                       $skipped = 0
@@ -365,5 +686,5 @@ stages:
                       $passed = $total - $failed - $skipped
                       Write-Host "total=$total passed=$passed failed=$failed skipped=$skipped"
                       if ($total -lt 1 -or $passed -lt 1 -or $failed -ne 0 -or $skipped -ne 0) {
-                        throw 'LiveCosmosEntraAuthenticationTest must contain at least one passing case and no failed or skipped cases.'
+                        throw "LiveCosmosEntraAuthenticationTest#$sentinelMethod must have at least one passing case and no failed or skipped cases."
                       }
