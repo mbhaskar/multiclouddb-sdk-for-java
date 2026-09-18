@@ -8,7 +8,10 @@
 # - grant this pipeline access to the approved OneES pool; do not authorize the
 #   live WIF service connection for jobs on alternate or queue-selectable pools;
 # - restrict manual runs and variable changes to trusted maintainers;
-# - set COSMOS_ENDPOINT as a non-secret pipeline variable;
+# - set COSMOS_ENDPOINT to the expected account URI as a fixed, non-secret
+#   pipeline/variable-group value and do not allow queue-time overrides;
+# - scope the WIF service connection identity's Cosmos data-plane RBAC role to
+#   that expected account (and the narrowest practical database/container scope);
 # - keep fork builds unable to request this pipeline or its protected resources.
 
 trigger:
@@ -80,67 +83,157 @@ stages:
                             -or $uri.Fragment `
                             -or (-not $uri.IsDefaultPort -and $uri.Port -ne 443) `
                             -or $uri.AbsolutePath -ne '/' `
-                            -or $uri.Host -notmatch '\.documents\.azure\.(com|us|cn|de)$') {
+                            -or $uri.Host -notmatch '\.documents\.azure\.(com|us|cn)$') {
                           $errors.Add('COSMOS_ENDPOINT must be an HTTPS Cosmos account URI such as https://account.documents.azure.com:443/.')
+                        }
+                      }
+
+                      $forbiddenCredentialVariables = @(
+                        'COSMOS_KEY',
+                        'AZURE_CLIENT_SECRET',
+                        'AZURE_CLIENT_CERTIFICATE_PATH',
+                        'AZURE_CLIENT_CERTIFICATE_PASSWORD'
+                      )
+                      foreach ($name in $forbiddenCredentialVariables) {
+                        $value = [Environment]::GetEnvironmentVariable($name)
+                        if (-not [string]::IsNullOrWhiteSpace($value)) {
+                          $errors.Add("Forbidden credential environment variable '$name' is set.")
+                        }
+                      }
+
+                      $forbiddenOptionVariables = @(
+                        'JAVA_TOOL_OPTIONS',
+                        '_JAVA_OPTIONS',
+                        'JDK_JAVA_OPTIONS',
+                        'MAVEN_OPTS',
+                        'MAVEN_ARGS'
+                      )
+                      foreach ($name in $forbiddenOptionVariables) {
+                        $value = [Environment]::GetEnvironmentVariable($name)
+                        if (-not [string]::IsNullOrWhiteSpace($value) `
+                            -and $value -match '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile)(?:\s*=|\s|$)') {
+                          $errors.Add(
+                            "Environment variable '$name' contains forbidden JVM property injection.")
                         }
                       }
 
                       $profiles = & mvn help:active-profiles -Plive-cosmos `
                         -pl multiclouddb-conformance -DskipTests 2>&1
+                      # Maven returns exit code 0 for an unknown -P profile, so preserve
+                      # this exact profile-list check. Echoing help output is safe: it
+                      # contains profile metadata, not effective property values.
+                      $profiles | ForEach-Object { Write-Host $_ }
                       if ($LASTEXITCODE -ne 0) {
                         $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
                       } elseif (-not ($profiles | Select-String -Pattern '^(?:\[[A-Z]+\]\s+)?\s*-\s+live-cosmos\s+\(source:')) {
                         $errors.Add(@'
                       The required Maven profile 'live-cosmos' does not exist or did not activate.
                       Add it with a dedicated com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest
-                      sentinel. The profile must omit cosmos.key, require cosmos.endpoint, use
-                      DefaultAzureCredential, fail rather than skip when prerequisites are absent,
-                      and isolate/clean up run-scoped fixtures.
+                      sentinel. That test must construct a live-specific MulticloudDbClientConfig
+                      with no key entry; it must not call ConformanceConfig.forProvider(COSMOS),
+                      which defaults to the emulator key. The profile must omit credential and
+                      endpoint injection, require cosmos.endpoint, use DefaultAzureCredential,
+                      fail rather than skip when prerequisites are absent, and isolate/clean up
+                      run-scoped fixtures.
                       '@)
                       }
 
                       if ($errors.Count -eq 0) {
+                        $sentinelSource = Join-Path '$(Build.SourcesDirectory)' `
+                          'multiclouddb-conformance/src/test/java/com/multiclouddb/conformance/LiveCosmosEntraAuthenticationTest.java'
+                        if (-not (Test-Path -LiteralPath $sentinelSource -PathType Leaf)) {
+                          $errors.Add(@'
+                      The required LiveCosmosEntraAuthenticationTest source file does not exist.
+                      It must perform a real Entra-authenticated Cosmos data-plane operation.
+                      '@)
+                        } else {
+                          $sentinelText = Get-Content -LiteralPath $sentinelSource -Raw
+                          if ($sentinelText -match '\bConformanceConfig\b' `
+                              -or $sentinelText -match '\.connection\s*\(\s*"key"' `
+                              -or $sentinelText -match '\b(?:CosmosConstants\s*\.\s*)?CONFIG_KEY\b' `
+                              -or $sentinelText -match '\.key\s*\(') {
+                            $errors.Add(@'
+                      LiveCosmosEntraAuthenticationTest references ConformanceConfig or a key-based
+                      client configuration API. Build a live-specific MulticloudDbClientConfig with
+                      endpoint only so DefaultAzureCredential is selected.
+                      '@)
+                          }
+                        }
+
                         $effectivePom = Join-Path '$(Agent.TempDirectory)' 'live-cosmos-effective-pom.xml'
                         & mvn help:effective-pom -Plive-cosmos -pl multiclouddb-conformance `
-                          -DskipTests "-Doutput=$effectivePom"
+                          -DskipTests -Dtest=LiveCosmosEntraAuthenticationTest `
+                          -Dsurefire.failIfNoSpecifiedTests=false `
+                          "-Dcosmos.endpoint=$endpoint" "-Doutput=$effectivePom"
                         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $effectivePom)) {
                           $errors.Add('Maven could not produce the activated live-cosmos effective POM.')
                         } else {
                           [xml]$effective = Get-Content -LiteralPath $effectivePom -Raw
                           $surefire = @($effective.SelectNodes(
-                            "/*[local-name()='project']/*[local-name()='build']/*[local-name()='plugins']/" +
-                            "*[local-name()='plugin'][*[local-name()='artifactId']='maven-surefire-plugin']"))
-                          $effectiveKeys = @($surefire | ForEach-Object {
-                            $_.SelectNodes(".//*[local-name()='systemPropertyVariables']/*[local-name()='cosmos.key']")
-                          })
-                          $effectiveEndpoints = @($surefire | ForEach-Object {
-                            $_.SelectNodes(".//*[local-name()='systemPropertyVariables']/*[local-name()='cosmos.endpoint']")
-                          })
-                          $unsafeTls = @($surefire | ForEach-Object {
-                            $_.SelectNodes(".//*[local-name()='argLine']")
-                          } | Where-Object {
-                            $_.InnerText -match '(?<![A-Za-z0-9_.])(?:-D)?jdk\.(?:tls|certpath)\.disabledAlgorithms(?:\s*=|\s|$)'
-                          })
+                            "//*[local-name()='project']/*[local-name()='build']/" +
+                            "*[local-name()='plugins']/*[local-name()='plugin']" +
+                            "[*[local-name()='artifactId']='maven-surefire-plugin']"))
+                          if ($surefire.Count -eq 0) {
+                            $errors.Add(@'
+                      The activated effective POM contains no maven-surefire-plugin configuration.
+                      The live profile must own an inspectable Surefire configuration for the
+                      LiveCosmosEntraAuthenticationTest sentinel.
+                      '@)
+                          } else {
+                            $forbiddenNames = @('cosmos.key', 'cosmos.endpoint', 'COSMOS_KEY', 'COSMOS_ENDPOINT')
+                            $forbiddenTlsNames = @(
+                              'jdk.tls.disabledAlgorithms',
+                              'jdk.certpath.disabledAlgorithms'
+                            )
+                            $injections = [System.Collections.Generic.List[string]]::new()
+                            foreach ($plugin in $surefire) {
+                              if (@($plugin.SelectNodes(
+                                  ".//*[local-name()='systemPropertiesFile']")).Count -ne 0) {
+                                $injections.Add('systemPropertiesFile')
+                              }
 
-                          if ($effectiveKeys.Count -ne 0) {
-                            $errors.Add(@'
-                      The activated live-cosmos effective Surefire configuration still defines
-                      cosmos.key. Remove the conformance module's inherited emulator credential
-                      injection; overriding only the endpoint or adding a test tag is insecure.
-                      '@)
-                          }
-                          if ($effectiveEndpoints.Count -ne 0) {
-                            $errors.Add(@'
-                      The activated live-cosmos effective Surefire configuration still defines
-                      cosmos.endpoint. Remove the inherited emulator endpoint injection and accept
-                      only the required -Dcosmos.endpoint value supplied by this pipeline.
-                      '@)
-                          }
-                          if ($unsafeTls.Count -ne 0) {
-                            $errors.Add(@'
-                      The activated live-cosmos effective Surefire configuration contains emulator
-                      TLS algorithm relaxation. The live profile must not inherit emulator-cosmos.
-                      '@)
+                              foreach ($containerName in @(
+                                  'systemPropertyVariables',
+                                  'systemProperties',
+                                  'environmentVariables')) {
+                                foreach ($container in @($plugin.SelectNodes(
+                                    ".//*[local-name()='$containerName']"))) {
+                                  foreach ($node in @($container.SelectNodes('.//*'))) {
+                                    $names = @($node.LocalName)
+                                    if ($node.LocalName -eq 'property') {
+                                      $names += @($node.SelectNodes("./*[local-name()='name']") |
+                                        ForEach-Object { $_.InnerText })
+                                    }
+                                    foreach ($name in $names) {
+                                      if ($forbiddenNames -contains $name) {
+                                        $injections.Add("$containerName/$name")
+                                      }
+                                      if ($forbiddenTlsNames -contains $name) {
+                                        $injections.Add("$containerName/$name")
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+
+                              foreach ($argLine in @($plugin.SelectNodes(
+                                  ".//*[local-name()='argLine']"))) {
+                                $text = $argLine.InnerText
+                                if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT))(?:\s*=|\s|$)') {
+                                  $injections.Add('argLine/Cosmos credential or endpoint')
+                                }
+                                if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?jdk\.(?:tls|certpath)\.disabledAlgorithms(?:\s*=|\s|$)') {
+                                  $injections.Add('argLine/JDK disabledAlgorithms')
+                                }
+                              }
+                            }
+
+                            if ($injections.Count -ne 0) {
+                              $errors.Add(
+                                'The activated live-cosmos effective Surefire configuration contains ' +
+                                'forbidden emulator/key/endpoint/TLS injection channels: ' +
+                                (($injections | Sort-Object -Unique) -join ', ') + '.')
+                            }
                           }
                         }
                       }
@@ -173,9 +266,33 @@ stages:
                     # in the same task so DefaultAzureCredential can use AzureCliCredential.
                     inlineScript: |
                       $ErrorActionPreference = 'Stop'
-                      az account show --query '{tenantId:tenantId, subscriptionId:id}' --output table
+                      az account show --output none
                       if ($LASTEXITCODE -ne 0) {
                         throw 'The WIF service connection could not establish an Azure CLI session.'
+                      }
+
+                      foreach ($name in @(
+                          'COSMOS_KEY',
+                          'AZURE_CLIENT_SECRET',
+                          'AZURE_CLIENT_CERTIFICATE_PATH',
+                          'AZURE_CLIENT_CERTIFICATE_PASSWORD')) {
+                        $value = [Environment]::GetEnvironmentVariable($name)
+                        if (-not [string]::IsNullOrWhiteSpace($value)) {
+                          throw "Forbidden credential environment variable '$name' is set."
+                        }
+                      }
+
+                      foreach ($name in @(
+                          'JAVA_TOOL_OPTIONS',
+                          '_JAVA_OPTIONS',
+                          'JDK_JAVA_OPTIONS',
+                          'MAVEN_OPTS',
+                          'MAVEN_ARGS')) {
+                        $value = [Environment]::GetEnvironmentVariable($name)
+                        if (-not [string]::IsNullOrWhiteSpace($value) `
+                            -and $value -match '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile)(?:\s*=|\s|$)') {
+                          throw "Environment variable '$name' contains forbidden JVM property injection."
+                        }
                       }
 
                       # This exact future sentinel must perform a real Cosmos data-plane
@@ -199,7 +316,7 @@ stages:
 
                 - task: PublishTestResults@2
                   displayName: Publish live Cosmos DB test results
-                  condition: always()
+                  condition: succeededOrFailed()
                   inputs:
                     testResultsFormat: JUnit
                     testResultsFiles: >-
@@ -212,7 +329,7 @@ stages:
 
                 - task: PowerShell@2
                   displayName: Verify live Cosmos DB results
-                  condition: always()
+                  condition: succeededOrFailed()
                   inputs:
                     targetType: inline
                     pwsh: true
