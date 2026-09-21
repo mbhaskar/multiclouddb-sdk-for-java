@@ -122,7 +122,7 @@ stages:
                       }
 
                       $forbiddenMavenConfigPattern =
-                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)(?:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s|=)|-(?:s|gs|t|gt)(?:\s|=)|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
+                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)["'']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
                       foreach ($relativeConfigPath in @(
                           '.mvn/maven.config',
                           '.mvn/jvm.config')) {
@@ -132,7 +132,7 @@ stages:
                           $configText = Get-Content -LiteralPath $configPath -Raw
                           if ($configText -match $forbiddenMavenConfigPattern) {
                             $errors.Add(
-                              "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or TLS injection.")
+                              "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or security-policy injection.")
                           }
                         }
                       }
@@ -208,12 +208,13 @@ stages:
                       sentinel method named entraAuthenticationPerformsCreateReadDelete. Use a
                       standalone final class with no class/extension annotations, inheritance,
                       lifecycle hooks, fields, helper members, or extra method annotations. The test
-                      must construct a live-specific MulticloudDbClientConfig whose
-                      only connection setting is System.getProperty("cosmos.endpoint"), with no
-                      key/auth entries; it must not call ConformanceConfig.forProvider(COSMOS), which
-                      defaults to the emulator key. Create the client in try-with-resources, delete
-                      the run-scoped item in finally, and fail rather than skip when endpoint, Azure
-                      CLI authentication, RBAC, or fixtures are unavailable. The profile must omit
+                      must use fully qualified com.multiclouddb.api config, provider, client, and
+                      factory types to construct a live-specific MulticloudDbClientConfig whose only
+                      connection setting is System.getProperty("cosmos.endpoint"), with no key/auth
+                      entries; it must not call ConformanceConfig.forProvider(COSMOS), which defaults
+                      to the emulator key. Create the client in try-with-resources, delete the
+                      run-scoped item in finally, and fail rather than skip when endpoint, Azure CLI
+                      authentication, RBAC, or fixtures are unavailable. The profile must omit
                       credential and endpoint injection and require cosmos.endpoint.
                       '@
                           )
@@ -300,7 +301,30 @@ stages:
                                 $state = 'textBlock'
                                 $index += 2
                               } elseif ($character -eq '"') {
-                                $state = 'string'
+                                $literalEnd = $index + 1
+                                while ($literalEnd -lt $Source.Length) {
+                                  if ($Source[$literalEnd] -eq '\') {
+                                    $literalEnd += 2
+                                    continue
+                                  }
+                                  if ($Source[$literalEnd] -eq '"') { break }
+                                  $literalEnd++
+                                }
+                                if ($literalEnd -ge $Source.Length) {
+                                  $state = 'string'
+                                } else {
+                                  $literal = $Source.Substring(
+                                    $index, $literalEnd - $index + 1)
+                                  if ($literal -eq '"endpoint"' `
+                                      -or $literal -eq '"cosmos.endpoint"') {
+                                    for ($literalIndex = $index;
+                                        $literalIndex -le $literalEnd;
+                                        $literalIndex++) {
+                                      $output[$literalIndex] = $Source[$literalIndex]
+                                    }
+                                  }
+                                  $index = $literalEnd
+                                }
                               } elseif ($character -eq "'") {
                                 $state = 'character'
                               } else {
@@ -412,7 +436,6 @@ stages:
                               break
                             }
                           }
-                          $sentinelMethodCode = ''
                           $sentinelMethodStructure = ''
                           if ($null -eq $methodMatch) {
                             $errors.Add(
@@ -426,9 +449,6 @@ stages:
                               $errors.Add(
                                 "Could not inspect the body of LiveCosmosEntraAuthenticationTest#$sentinelMethod.")
                             } else {
-                              $bodyStart = $classBodyStart + $bodyStartInClass
-                              $sentinelMethodCode = $sentinelText.Substring(
-                                $bodyStart, $sentinelMethodStructure.Length)
                               $methodEndInClass =
                                 $bodyStartInClass + $sentinelMethodStructure.Length
                               $membersBeforeMethod = $classStructure.Substring(
@@ -456,9 +476,19 @@ stages:
                             $missingContract.Add(
                               'no conditional, loop, catch, synchronized, assertDoesNotThrow, or lambda wrappers')
                           }
+                          $apiPrefix =
+                            'com\s*\.\s*multiclouddb\s*\.\s*api\s*\.'
+                          $configTypePattern =
+                            "${apiPrefix}MulticloudDbClientConfig"
+                          $providerTypePattern =
+                            "${apiPrefix}ProviderId"
+                          $clientTypePattern =
+                            "${apiPrefix}MulticloudDbClient"
+                          $factoryTypePattern =
+                            "${apiPrefix}MulticloudDbClientFactory"
                           $configMatch = [regex]::Match(
                             $sentinelMethodStructure,
-                            '(?s)\b(?:var|MulticloudDbClientConfig)\s+(?<config>\w+)\s*=\s*MulticloudDbClientConfig\s*\.\s*builder\s*\(\s*\)(?<chain>[^;]*)\.\s*build\s*\(\s*\)\s*;')
+                            "(?s)\b$configTypePattern\s+(?<config>\w+)\s*=\s*$configTypePattern\s*\.\s*builder\s*\(\s*\)(?<chain>[^;]*)\.\s*build\s*\(\s*\)\s*;")
                           if (-not $configMatch.Success `
                               -or (Get-JavaBraceDepth `
                                 $sentinelMethodStructure $configMatch.Index) -ne 1) {
@@ -473,11 +503,12 @@ stages:
                                   "\b$configName\s*[+\-*/]=") {
                               $missingContract.Add('a config variable that is never reassigned')
                             }
-                            $configCode = $sentinelMethodCode.Substring(
+                            $configCode = $sentinelMethodStructure.Substring(
                               $configMatch.Index, $configMatch.Length)
                             if ($configMatch.Groups['chain'].Value -notmatch
-                                '\.\s*provider\s*\(\s*ProviderId\s*\.\s*COSMOS\s*\)') {
-                              $missingContract.Add('ProviderId.COSMOS selection')
+                                "\.\s*provider\s*\(\s*$providerTypePattern\s*\.\s*COSMOS\s*\)") {
+                              $missingContract.Add(
+                                'fully qualified com.multiclouddb.api.ProviderId.COSMOS selection')
                             }
                             $endpointConnectionPattern =
                               '\.\s*connection\s*\(\s*"endpoint"\s*,\s*System\s*\.\s*getProperty\s*\(\s*"cosmos\.endpoint"\s*\)\s*\)'
@@ -490,10 +521,10 @@ stages:
                             }
 
                             $factoryCallPattern =
-                              '\bMulticloudDbClientFactory\s*\.\s*create\s*\('
+                              "\b$factoryTypePattern\s*\.\s*create\s*\("
                             $clientMatch = [regex]::Match(
                               $sentinelMethodStructure,
-                              "(?s)\btry\s*\(\s*(?:var|MulticloudDbClient)\s+(?<client>\w+)\s*=\s*MulticloudDbClientFactory\s*\.\s*create\s*\(\s*$configName\s*\)\s*;?\s*\)\s*\{")
+                              "(?s)\btry\s*\(\s*$clientTypePattern\s+(?<client>\w+)\s*=\s*$factoryTypePattern\s*\.\s*create\s*\(\s*$configName\s*\)\s*;?\s*\)\s*\{")
                             if (-not $clientMatch.Success `
                                 -or (Get-JavaBraceDepth `
                                   $sentinelMethodStructure $clientMatch.Index) -ne 1 `
@@ -501,7 +532,7 @@ stages:
                                   $sentinelMethodStructure,
                                   $factoryCallPattern)).Count -ne 1) {
                               $missingContract.Add(
-                                'one method-level factory client created from that config in try-with-resources')
+                                'one fully qualified com.multiclouddb.api factory/client path created from that config in try-with-resources')
                             } else {
                               $clientName = [regex]::Escape($clientMatch.Groups['client'].Value)
                               if (@([regex]::Matches(
@@ -602,8 +633,10 @@ stages:
                       delete in finally, and guarantee client close with try-with-resources even
                       when delete fails. The final class must contain no class/extension annotations,
                       inheritance, lifecycle hooks, fields, helper members, or extra method
-                      annotations. These checks reject known unsafe/trivial sentinels; code review
-                      must still confirm live operation and cleanup semantics.
+                      annotations, and its config/provider/client/factory references must use the
+                      fully qualified com.multiclouddb.api types. These checks reject known
+                      unsafe/trivial sentinels; code review must still confirm live operation and
+                      cleanup semantics.
                       "@
                       )
                           }
@@ -652,7 +685,7 @@ stages:
                               $configText = Get-Content -LiteralPath $configPath -Raw
                               if ($configText -match $forbiddenMavenConfigPattern) {
                                 $errors.Add(
-                                  "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or TLS injection.")
+                                  "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or security-policy injection.")
                               }
                             }
                           }
@@ -701,9 +734,10 @@ stages:
                       )
                           } else {
                             $forbiddenNames = @('cosmos.key', 'cosmos.endpoint', 'COSMOS_KEY', 'COSMOS_ENDPOINT')
-                            $forbiddenTlsNames = @(
+                            $forbiddenSecurityPropertyNames = @(
                               'jdk.tls.disabledAlgorithms',
-                              'jdk.certpath.disabledAlgorithms'
+                              'jdk.certpath.disabledAlgorithms',
+                              'java.security.properties'
                             )
                             $injections = [System.Collections.Generic.List[string]]::new()
                             foreach ($plugin in $surefire) {
@@ -728,7 +762,7 @@ stages:
                                       if ($forbiddenNames -contains $name) {
                                         $injections.Add("$containerName/$name")
                                       }
-                                      if ($forbiddenTlsNames -contains $name) {
+                                      if ($forbiddenSecurityPropertyNames -contains $name) {
                                         $injections.Add("$containerName/$name")
                                         }
                                       }
@@ -743,8 +777,8 @@ stages:
                                 if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT))(?:\s*=|\s|$)') {
                                   $injections.Add('argLine/Cosmos credential or endpoint')
                                 }
-                                if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?jdk\.(?:tls|certpath)\.disabledAlgorithms(?:\s*=|\s|$)') {
-                                  $injections.Add('argLine/JDK disabledAlgorithms')
+                                if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?(?:jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties)(?:\s*=|\s|$)') {
+                                  $injections.Add('argLine/JDK security policy')
                                 }
                               }
                             }
@@ -753,7 +787,7 @@ stages:
                               $injectionList = ($injections | Sort-Object -Unique) -join ', '
                               $errors.Add(@"
                       The activated live-cosmos effective Surefire configuration contains forbidden
-                      emulator/key/endpoint/TLS injection channels: $injectionList.
+                      emulator/key/endpoint/security-policy injection channels: $injectionList.
                       multiclouddb-conformance/pom.xml currently declares emulator endpoint/key
                       injection in its own build/plugins, which a root-POM profile cannot override.
                       Declare live-cosmos in multiclouddb-conformance/pom.xml and replace that
@@ -828,7 +862,7 @@ stages:
                       }
 
                       $forbiddenMavenConfigPattern =
-                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)(?:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s|=)|-(?:s|gs|t|gt)(?:\s|=)|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
+                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)["'']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
@@ -851,7 +885,7 @@ stages:
                           Write-Host "Inspecting Maven configuration file: $relativeConfigPath"
                           $configText = Get-Content -LiteralPath $configPath -Raw
                           if ($configText -match $forbiddenMavenConfigPattern) {
-                            throw "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or TLS injection."
+                            throw "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or security-policy injection."
                           }
                         }
                       }
