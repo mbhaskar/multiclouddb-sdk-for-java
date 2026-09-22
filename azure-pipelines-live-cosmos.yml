@@ -3,6 +3,8 @@
 # ADO administrators must:
 # - authorize only this pipeline to use the multiclouddb-cosmos-live-ci WIF
 #   service connection and the multiclouddb-cosmos-live environment;
+# - configure resource-owned branch-control checks on both protected resources
+#   to require refs/heads/main and fail closed for unknown or unprotected refs;
 # - add an exclusive-lock check to that environment (this pipeline requests
 #   sequential lock behavior because today's tests use shared fixture names);
 # - grant this pipeline access to the approved OneES pool; do not authorize the
@@ -12,7 +14,14 @@
 #   pipeline/variable-group value and do not allow queue-time overrides;
 # - scope the WIF service connection identity's Cosmos data-plane RBAC role to
 #   that expected account (and the narrowest practical database/container scope);
-# - keep fork builds unable to request this pipeline or its protected resources.
+# - keep fork builds unable to request this pipeline or its protected resources;
+# - review the future Java sentinel/profile implementation. The source-shape
+#   checks below catch known onboarding mistakes; they do not prove arbitrary
+#   trusted Java code safe or prove live WIF/RBAC behavior without execution.
+#
+# The YAML branch condition below is defense in depth. An altered branch can
+# remove YAML checks, so the environment/service-connection checks are the
+# authorization boundary for the protected identity.
 
 trigger:
   batch: true
@@ -35,8 +44,8 @@ lockBehavior: sequential
 stages:
   - stage: LiveCosmos
     displayName: Cosmos DB live-account tests
-    # Manual runs are also limited to main; selecting an arbitrary branch must
-    # never make that branch eligible to reach the protected live identity.
+    # Defense in depth for manual runs; protected-resource branch control must
+    # independently reject any source other than protected refs/heads/main.
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - deployment: CosmosLiveConformance
@@ -92,6 +101,23 @@ stages:
                       $ErrorActionPreference = 'Stop'
                       $errors = [System.Collections.Generic.List[string]]::new()
                       $endpoint = $env:COSMOS_ENDPOINT
+                      $sentinelMethod =
+                        'entraAuthenticationPerformsCreateReadDelete'
+                      $effectivePom = Join-Path '$(Agent.TempDirectory)' `
+                        'live-cosmos-effective-pom.xml'
+                      $argumentManifest = Join-Path '$(Agent.TempDirectory)' `
+                        'live-cosmos-maven-arguments.json'
+                      foreach ($stalePreflightArtifact in @(
+                          $effectivePom,
+                          $argumentManifest)) {
+                        if (Test-Path -LiteralPath $stalePreflightArtifact) {
+                          Remove-Item -LiteralPath $stalePreflightArtifact `
+                            -Force -ErrorAction Stop
+                        }
+                        if (Test-Path -LiteralPath $stalePreflightArtifact) {
+                          throw "Stale preflight artifact could not be removed: $([IO.Path]::GetFileName($stalePreflightArtifact))"
+                        }
+                      }
                       $trustedProjectBase = (Resolve-Path -LiteralPath `
                         '$(Build.SourcesDirectory)').Path
                       $currentProjectBase = (Resolve-Path -LiteralPath `
@@ -121,8 +147,10 @@ stages:
                         }
                       }
 
+                      $forbiddenJvmPropertyPattern =
+                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)(?:\s*=|\s|$)'
                       $forbiddenMavenConfigPattern =
-                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)["'']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
+                        "$forbiddenJvmPropertyPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
                       foreach ($relativeConfigPath in @(
                           '.mvn/maven.config',
                           '.mvn/jvm.config')) {
@@ -140,6 +168,30 @@ stages:
                       if (Test-Path -LiteralPath $extensionsPath) {
                         $errors.Add(
                           "Maven core extension file '.mvn/extensions.xml' is not permitted in the live WIF pipeline.")
+                      }
+
+                      $modulePomPath = Join-Path $trustedProjectBase `
+                        'multiclouddb-conformance/pom.xml'
+                      if (-not (Test-Path -LiteralPath $modulePomPath -PathType Leaf)) {
+                        $errors.Add(
+                          'The multiclouddb-conformance module POM is missing.')
+                      } else {
+                        [xml]$modulePom = Get-Content -LiteralPath $modulePomPath -Raw
+                        $namespace = [System.Xml.XmlNamespaceManager]::new(
+                          $modulePom.NameTable)
+                        $namespace.AddNamespace(
+                          'm', $modulePom.DocumentElement.NamespaceURI)
+                        $moduleLiveProfiles = @($modulePom.SelectNodes(
+                          '/m:project/m:profiles/m:profile[m:id="live-cosmos"]',
+                          $namespace))
+                        if ($moduleLiveProfiles.Count -ne 1) {
+                          $errors.Add(@'
+                      The live-cosmos profile must be declared exactly once in
+                      multiclouddb-conformance/pom.xml. A settings-only or root-only profile does
+                      not securely replace that module's emulator Surefire configuration.
+                      '@
+                          )
+                        }
                       }
 
                       if ([string]::IsNullOrWhiteSpace($endpoint) -or $endpoint.StartsWith('$(')) {
@@ -189,17 +241,37 @@ stages:
                       }
 
                       if ($errors.Count -eq 0) {
-                        $profiles = & mvn help:active-profiles -Plive-cosmos `
-                          -pl multiclouddb-conformance -DskipTests 2>&1
+                        # Keep this data-only array identical for profile inspection,
+                        # effective-POM inspection, and the later WIF test execution.
+                        $liveMavenArguments = @(
+                          '-Plive-cosmos',
+                          '-pl',
+                          'multiclouddb-conformance',
+                          '-am',
+                          "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod",
+                          '-Dsurefire.failIfNoSpecifiedTests=false',
+                          "-Dcosmos.endpoint=$endpoint",
+                          '-Djunit.jupiter.execution.timeout.default=60s',
+                          '-DtrimStackTrace=false',
+                          "-Doutput=$effectivePom"
+                        )
+                        $profilesOutput = & mvn help:active-profiles `
+                          @liveMavenArguments 2>&1
+                        $profilesExitCode = $LASTEXITCODE
+                        $profiles = if (Test-Path -LiteralPath $effectivePom -PathType Leaf) {
+                          Get-Content -LiteralPath $effectivePom
+                        } else {
+                          $profilesOutput
+                        }
                         # Maven returns exit code 0 for an unknown -P profile, so preserve
                         # this exact profile-list check. Echoing help output is safe: it
                         # contains profile metadata, not effective property values.
-                        $profiles |
+                        $profilesOutput |
                           Where-Object {
                             $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
                           } |
                           ForEach-Object { Write-Host $_ }
-                        if ($LASTEXITCODE -ne 0) {
+                        if ($profilesExitCode -ne 0) {
                           $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
                         } elseif (-not ($profiles | Select-String -Pattern '^(?:\[[A-Z]+\]\s+)?\s*-\s+live-cosmos\s+\(source:')) {
                           $errors.Add(@'
@@ -222,7 +294,6 @@ stages:
                       }
 
                       if ($errors.Count -eq 0) {
-                        $sentinelMethod = 'entraAuthenticationPerformsCreateReadDelete'
                         $sentinelSource = Join-Path '$(Build.SourcesDirectory)' `
                           'multiclouddb-conformance/src/test/java/com/multiclouddb/conformance/LiveCosmosEntraAuthenticationTest.java'
                         if (-not (Test-Path -LiteralPath $sentinelSource -PathType Leaf)) {
@@ -486,6 +557,8 @@ stages:
                             "${apiPrefix}MulticloudDbClient"
                           $factoryTypePattern =
                             "${apiPrefix}MulticloudDbClientFactory"
+                          $resourceAddressTypePattern =
+                            "${apiPrefix}ResourceAddress"
                           $configMatch = [regex]::Match(
                             $sentinelMethodStructure,
                             "(?s)\b$configTypePattern\s+(?<config>\w+)\s*=\s*$configTypePattern\s*\.\s*builder\s*\(\s*\)(?<chain>[^;]*)\.\s*build\s*\(\s*\)\s*;")
@@ -568,58 +641,88 @@ stages:
                                   $missingContract.Add('a run-scoped key variable that is never reassigned')
                                 }
 
-                                $protectedFlow = $false
-                                foreach ($tryMatch in [regex]::Matches(
-                                    $clientScope, '\btry\s*\{')) {
-                                  $tryStart = $clientScope.IndexOf(
-                                    '{', $tryMatch.Index)
-                                  $tryBody = Get-BalancedJavaBlock `
-                                    $clientScope $tryStart
-                                  if ([string]::IsNullOrWhiteSpace($tryBody)) { continue }
-
-                                  $afterTry = $tryStart + $tryBody.Length
-                                  $afterTryText = $clientScope.Substring($afterTry)
-                                  $finallyMatch = [regex]::Match(
-                                    $afterTryText, '^\s*finally\s*\{')
-                                  if (-not $finallyMatch.Success) { continue }
-                                  $finallyStart = $afterTry + $afterTryText.IndexOf(
-                                    '{', $finallyMatch.Index)
-                                  $finallyBody = Get-BalancedJavaBlock `
-                                    $clientScope $finallyStart
-
-                                  $tryStatements = $tryBody.Substring(
-                                    1, $tryBody.Length - 2)
-                                  $finallyStatements = $finallyBody.Substring(
-                                    1, $finallyBody.Length - 2)
-                                  $wrappedFlowPattern =
-                                    '(?:[{}]|->|\b(?:if|else|for|while|do|switch|try|catch|synchronized)\b)'
-                                  if ($tryStatements -match $wrappedFlowPattern `
-                                      -or $finallyStatements -match $wrappedFlowPattern) {
-                                    continue
+                                $addressMatch = [regex]::Match(
+                                  $sentinelMethodStructure,
+                                  "(?s)\b(?:var|$resourceAddressTypePattern)\s+(?<address>\w+)\s*=\s*new\s+$resourceAddressTypePattern\s*\([^;]*\)\s*;")
+                                if (-not $addressMatch.Success `
+                                    -or (Get-JavaBraceDepth `
+                                      $sentinelMethodStructure $addressMatch.Index) -ne 1) {
+                                  $missingContract.Add(
+                                    'a method-level com.multiclouddb.api.ResourceAddress')
+                                } else {
+                                  $addressName = [regex]::Escape(
+                                    $addressMatch.Groups['address'].Value)
+                                  if (@([regex]::Matches(
+                                      $sentinelMethodStructure,
+                                      "\b$addressName\s*=(?!=)")).Count -ne 1 `
+                                      -or $sentinelMethodStructure -match
+                                        "\b$addressName\s*[+\-*/]=") {
+                                    $missingContract.Add(
+                                      'a resource-address variable that is never reassigned')
                                   }
 
-                                  $createPattern =
-                                    "(?s)\b$clientName\s*\.\s*create\s*\(\s*[^,;]+\s*,\s*$keyName\s*,"
-                                  $readPattern =
-                                    "(?s)\b(?:var|DocumentResult)\s+(?<result>\w+)\s*=\s*$clientName\s*\.\s*read\s*\(\s*[^,;]+\s*,\s*$keyName\s*(?:,|\))"
-                                  $readMatch = [regex]::Match($tryBody, $readPattern)
-                                  $deletePattern =
-                                    "(?s)\b$clientName\s*\.\s*delete\s*\(\s*[^,;]+\s*,\s*$keyName\s*(?:,|\))"
-                                  if ($tryBody -match $createPattern `
-                                      -and $readMatch.Success `
-                                      -and $finallyBody -match $deletePattern) {
-                                    $readResultName = [regex]::Escape(
-                                      $readMatch.Groups['result'].Value)
-                                    if ($tryBody -match
-                                        "(?s)\bassertNotNull\s*\(\s*$readResultName\s*\)") {
-                                      $protectedFlow = $true
-                                      break
+                                  $protectedFlow = $false
+                                  foreach ($tryMatch in [regex]::Matches(
+                                      $clientScope, '\btry\s*\{')) {
+                                    $tryStart = $clientScope.IndexOf(
+                                      '{', $tryMatch.Index)
+                                    $tryBody = Get-BalancedJavaBlock `
+                                      $clientScope $tryStart
+                                    if ([string]::IsNullOrWhiteSpace($tryBody)) { continue }
+
+                                    $afterTry = $tryStart + $tryBody.Length
+                                    $afterTryText = $clientScope.Substring($afterTry)
+                                    $finallyMatch = [regex]::Match(
+                                      $afterTryText, '^\s*finally\s*\{')
+                                    if (-not $finallyMatch.Success) { continue }
+                                    $finallyStart = $afterTry + $afterTryText.IndexOf(
+                                      '{', $finallyMatch.Index)
+                                    $finallyBody = Get-BalancedJavaBlock `
+                                      $clientScope $finallyStart
+
+                                    $tryStatements = $tryBody.Substring(
+                                      1, $tryBody.Length - 2)
+                                    $finallyStatements = $finallyBody.Substring(
+                                      1, $finallyBody.Length - 2)
+                                    $wrappedFlowPattern =
+                                      '(?:[{}]|->|\b(?:if|else|for|while|do|switch|try|catch|synchronized)\b)'
+                                    if ($tryStatements -match $wrappedFlowPattern `
+                                        -or $finallyStatements -match $wrappedFlowPattern) {
+                                      continue
+                                    }
+
+                                    $createPattern =
+                                      "(?s)\b$clientName\s*\.\s*create\s*\(\s*$addressName\s*,\s*$keyName\s*,"
+                                    $readPattern =
+                                      "(?s)\b(?:var|DocumentResult)\s+(?<result>\w+)\s*=\s*$clientName\s*\.\s*read\s*\(\s*$addressName\s*,\s*$keyName\s*(?:,|\))"
+                                    $createMatch = [regex]::Match(
+                                      $tryBody, $createPattern)
+                                    $readMatch = [regex]::Match(
+                                      $tryBody, $readPattern)
+                                    $deletePattern =
+                                      "(?s)\b$clientName\s*\.\s*delete\s*\(\s*$addressName\s*,\s*$keyName\s*(?:,|\))"
+                                    $deleteMatch = [regex]::Match(
+                                      $finallyBody, $deletePattern)
+                                    if ($createMatch.Success `
+                                        -and $readMatch.Success `
+                                        -and $deleteMatch.Success `
+                                        -and $createMatch.Index -lt $readMatch.Index) {
+                                      $readResultName = [regex]::Escape(
+                                        $readMatch.Groups['result'].Value)
+                                      $assertMatch = [regex]::Match(
+                                        $tryBody,
+                                        "(?s)\bassertNotNull\s*\(\s*$readResultName\s*\)")
+                                      if ($assertMatch.Success `
+                                          -and $readMatch.Index -lt $assertMatch.Index) {
+                                        $protectedFlow = $true
+                                        break
+                                      }
                                     }
                                   }
-                                }
-                                if (-not $protectedFlow) {
-                                  $missingContract.Add(
-                                    'create/read/assertNotNull protected by the finally that deletes the same client/key')
+                                  if (-not $protectedFlow) {
+                                    $missingContract.Add(
+                                      'ordered create/read/assertNotNull protected by the finally that deletes the same client/address/key')
+                                  }
                                 }
                               }
                             }
@@ -629,14 +732,15 @@ stages:
                       LiveCosmosEntraAuthenticationTest#$sentinelMethod is missing required source
                       contract elements: $(($missingContract -join ', ')). The exact method must
                       directly bind its sole endpoint to System.getProperty("cosmos.endpoint"),
-                      configure no key/auth entries, create/read/verify/delete a run-scoped item,
-                      delete in finally, and guarantee client close with try-with-resources even
-                      when delete fails. The final class must contain no class/extension annotations,
-                      inheritance, lifecycle hooks, fields, helper members, or extra method
-                      annotations, and its config/provider/client/factory references must use the
-                      fully qualified com.multiclouddb.api types. These checks reject known
-                      unsafe/trivial sentinels; code review must still confirm live operation and
-                      cleanup semantics.
+                      configure no key/auth entries, and use one unchanged fully qualified
+                      com.multiclouddb.api.ResourceAddress variable for its ordered
+                      create/read/verify/delete flow. It must delete in finally and guarantee client
+                      close with try-with-resources even when delete fails. The final class must
+                      contain no class/extension annotations, inheritance, lifecycle hooks, fields,
+                      helper members, or extra method annotations, and its config/provider/client/
+                      factory references must use the fully qualified com.multiclouddb.api types.
+                      These checks reject known unsafe/trivial sentinels; code review must still
+                      confirm live operation and cleanup semantics.
                       "@
                       )
                           }
@@ -698,18 +802,11 @@ stages:
                         }
 
                         if ($errors.Count -eq 0) {
-                          $effectivePom = Join-Path '$(Agent.TempDirectory)' `
-                            'live-cosmos-effective-pom.xml'
                           if (Test-Path -LiteralPath $effectivePom) {
                             Remove-Item -LiteralPath $effectivePom -Force -ErrorAction Stop
                           }
-                          # Keep dotted -D arguments quoted. PowerShell otherwise
-                          # splits them before Maven receives the complete option.
-                          $effectivePomOutput = & mvn help:effective-pom -Plive-cosmos `
-                            -pl multiclouddb-conformance `
-                            '-DskipTests' "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod" `
-                            '-Dsurefire.failIfNoSpecifiedTests=false' `
-                            "-Dcosmos.endpoint=$endpoint" "-Doutput=$effectivePom" 2>&1
+                          $effectivePomOutput = & mvn help:effective-pom `
+                            @liveMavenArguments 2>&1
                           $effectivePomExitCode = $LASTEXITCODE
                           $effectivePomOutput |
                             Where-Object {
@@ -721,23 +818,46 @@ stages:
                             $errors.Add('Maven could not produce the activated live-cosmos effective POM.')
                           } else {
                           [xml]$effective = Get-Content -LiteralPath $effectivePom -Raw
-                          $surefire = @($effective.SelectNodes(
-                            "//*[local-name()='project']/*[local-name()='build']/" +
-                            "*[local-name()='plugins']/*[local-name()='plugin']" +
-                            "[*[local-name()='artifactId']='maven-surefire-plugin']"))
-                          if ($surefire.Count -eq 0) {
+                          $conformanceProjects = @($effective.SelectNodes(
+                            "//*[local-name()='project']" +
+                            "[normalize-space(*[local-name()='artifactId'])=" +
+                            "'multiclouddb-conformance']"))
+                          $surefire = if ($conformanceProjects.Count -eq 1) {
+                            @($conformanceProjects[0].SelectNodes(
+                              "./*[local-name()='build']/" +
+                              "*[local-name()='plugins']/*[local-name()='plugin']" +
+                              "[normalize-space(*[local-name()='artifactId'])=" +
+                              "'maven-surefire-plugin']"))
+                          } else {
+                            @()
+                          }
+                          if ($conformanceProjects.Count -ne 1 `
+                              -or $surefire.Count -eq 0) {
                             $errors.Add(@'
-                      The activated effective POM contains no maven-surefire-plugin configuration.
-                      The live profile must own an inspectable Surefire configuration for the
-                      LiveCosmosEntraAuthenticationTest sentinel.
+                      The activated effective POM must contain exactly one
+                      multiclouddb-conformance project with an inspectable maven-surefire-plugin
+                      configuration for the LiveCosmosEntraAuthenticationTest sentinel. A plugin
+                      from another reactor module does not satisfy this requirement.
                       '@
                       )
                           } else {
-                            $forbiddenNames = @('cosmos.key', 'cosmos.endpoint', 'COSMOS_KEY', 'COSMOS_ENDPOINT')
-                            $forbiddenSecurityPropertyNames = @(
+                            $forbiddenSystemPropertyNames = @(
+                              'cosmos.key',
+                              'cosmos.endpoint',
+                              'COSMOS_KEY',
+                              'COSMOS_ENDPOINT',
                               'jdk.tls.disabledAlgorithms',
                               'jdk.certpath.disabledAlgorithms',
-                              'java.security.properties'
+                              'java.security.properties',
+                              'AZURE_TOKEN_CREDENTIALS'
+                            )
+                            $forbiddenEnvironmentNames = @(
+                              'cosmos.key',
+                              'cosmos.endpoint',
+                              'COSMOS_KEY',
+                              'COSMOS_ENDPOINT',
+                              'AZURE_TOKEN_CREDENTIALS',
+                              'AZURE_CONFIG_DIR'
                             )
                             $injections = [System.Collections.Generic.List[string]]::new()
                             foreach ($plugin in $surefire) {
@@ -745,11 +865,9 @@ stages:
                                   ".//*[local-name()='systemPropertiesFile']")).Count -ne 0) {
                                 $injections.Add('systemPropertiesFile')
                               }
-
                               foreach ($containerName in @(
                                   'systemPropertyVariables',
-                                  'systemProperties',
-                                  'environmentVariables')) {
+                                  'systemProperties')) {
                                 foreach ($container in @($plugin.SelectNodes(
                                     ".//*[local-name()='$containerName']"))) {
                                   foreach ($node in @($container.SelectNodes('.//*'))) {
@@ -759,13 +877,54 @@ stages:
                                         ForEach-Object { $_.InnerText })
                                     }
                                     foreach ($name in $names) {
-                                      if ($forbiddenNames -contains $name) {
+                                      if ($forbiddenSystemPropertyNames -contains $name) {
                                         $injections.Add("$containerName/$name")
                                       }
-                                      if ($forbiddenSecurityPropertyNames -contains $name) {
-                                        $injections.Add("$containerName/$name")
-                                        }
-                                      }
+                                    }
+                                  }
+                                }
+                              }
+
+                              foreach ($container in @($plugin.SelectNodes(
+                                  ".//*[local-name()='environmentVariables']"))) {
+                                foreach ($entry in @($container.SelectNodes('./*'))) {
+                                  $entryNames = @($entry.LocalName)
+                                  if ($entry.LocalName -eq 'property') {
+                                    $entryNames += @($entry.SelectNodes(
+                                      "./*[local-name()='name']") |
+                                      ForEach-Object { $_.InnerText })
+                                  }
+                                  foreach ($entryName in $entryNames) {
+                                    if ($forbiddenEnvironmentNames -contains $entryName) {
+                                      $injections.Add(
+                                        "environmentVariables/$entryName")
+                                    }
+                                    if ($forbiddenOptionVariables -contains $entryName `
+                                        -and $entry.InnerText -match
+                                          $forbiddenMavenConfigPattern) {
+                                      $injections.Add(
+                                        "environmentVariables/$entryName content")
+                                    }
+                                  }
+                                }
+                              }
+
+                              foreach ($container in @($plugin.SelectNodes(
+                                  ".//*[local-name()='excludedEnvironmentVariables']"))) {
+                                $excludedElements = @($container.SelectNodes('./*'))
+                                $rawExcludedNames = if ($excludedElements.Count -ne 0) {
+                                  @($excludedElements |
+                                    ForEach-Object { $_.InnerText })
+                                } else {
+                                  @($container.InnerText)
+                                }
+                                foreach ($rawExcludedName in $rawExcludedNames) {
+                                  foreach ($excludedName in @(
+                                      $rawExcludedName -split '[,\s]+' |
+                                      Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+                                    if ($forbiddenEnvironmentNames -contains $excludedName) {
+                                      $injections.Add(
+                                        "excludedEnvironmentVariables/$excludedName")
                                     }
                                   }
                                 }
@@ -773,12 +932,10 @@ stages:
 
                               foreach ($argLine in @($plugin.SelectNodes(
                                   ".//*[local-name()='argLine']"))) {
-                                $text = $argLine.InnerText
-                                if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT))(?:\s*=|\s|$)') {
-                                  $injections.Add('argLine/Cosmos credential or endpoint')
-                                }
-                                if ($text -match '(?<![A-Za-z0-9_.])(?:-D)?(?:jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties)(?:\s*=|\s|$)') {
-                                  $injections.Add('argLine/JDK security policy')
+                                if ($argLine.InnerText -match
+                                    $forbiddenJvmPropertyPattern) {
+                                  $injections.Add(
+                                    'argLine/forbidden JVM property')
                                 }
                               }
                             }
@@ -787,15 +944,32 @@ stages:
                               $injectionList = ($injections | Sort-Object -Unique) -join ', '
                               $errors.Add(@"
                       The activated live-cosmos effective Surefire configuration contains forbidden
-                      emulator/key/endpoint/security-policy injection channels: $injectionList.
+                      emulator/key/endpoint/security-policy or identity-routing injection channels:
+                      $injectionList. The test JVM must inherit AZURE_TOKEN_CREDENTIALS=
+                      AzureCliCredential and AZURE_CONFIG_DIR from the protected AzureCLI task;
+                      Surefire must not override or exclude either variable.
                       multiclouddb-conformance/pom.xml currently declares emulator endpoint/key
                       injection in its own build/plugins, which a root-POM profile cannot override.
                       Declare live-cosmos in multiclouddb-conformance/pom.xml and replace that
                       configuration with combine.self='override', or safely relocate emulator injection.
                       "@
-                      )
+                              )
                             }
                           }
+                        }
+                      }
+                      }
+
+                      if ($errors.Count -eq 0) {
+                        $manifestJson = ConvertTo-Json `
+                          -InputObject ([object[]]$liveMavenArguments) -Compress
+                        [System.IO.File]::WriteAllText(
+                          $argumentManifest,
+                          $manifestJson,
+                          [System.Text.UTF8Encoding]::new($false))
+                        if (-not (Test-Path -LiteralPath $argumentManifest -PathType Leaf)) {
+                          $errors.Add(
+                            'The validated Maven argument manifest was not written.')
                         }
                       }
 
@@ -815,6 +989,9 @@ stages:
                     scriptType: pscore
                     scriptLocation: inlineScript
                     cwd: $(Build.SourcesDirectory)
+                    visibleAzLogin: false
+                    useGlobalConfig: false
+                    addSpnToEnvironment: false
                     # AzureCLI logs in with the WIF service connection. Maven runs
                     # in the same task so DefaultAzureCredential can use AzureCliCredential.
                     inlineScript: |
@@ -822,6 +999,38 @@ stages:
                       az account show --output none
                       if ($LASTEXITCODE -ne 0) {
                         throw 'The WIF service connection could not establish an Azure CLI session.'
+                      }
+                      if ($env:AZURE_TOKEN_CREDENTIALS -cne 'AzureCliCredential') {
+                        throw 'AZURE_TOKEN_CREDENTIALS must remain AzureCliCredential.'
+                      }
+                      if ([string]::IsNullOrWhiteSpace($env:AZURE_CONFIG_DIR)) {
+                        throw 'AzureCLI must provide an isolated AZURE_CONFIG_DIR.'
+                      }
+
+                      $argumentManifest = Join-Path '$(Agent.TempDirectory)' `
+                        'live-cosmos-maven-arguments.json'
+                      if (-not (Test-Path -LiteralPath $argumentManifest -PathType Leaf)) {
+                        throw 'The validated Maven argument manifest is missing.'
+                      }
+                      $manifestValue = Get-Content -LiteralPath `
+                        $argumentManifest -Raw | ConvertFrom-Json -NoEnumerate
+                      if ($manifestValue -isnot [System.Array]) {
+                        throw 'The Maven argument manifest must decode to a JSON array.'
+                      }
+                      $liveMavenArguments = @($manifestValue)
+                      if ($liveMavenArguments.Count -eq 0 `
+                          -or @($liveMavenArguments | Where-Object {
+                            $_ -isnot [string] `
+                              -or [string]::IsNullOrWhiteSpace($_)
+                          }).Count -ne 0) {
+                        throw 'The Maven argument manifest must be a non-empty string array.'
+                      }
+                      $expectedEndpointArgument =
+                        "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT"
+                      if (@($liveMavenArguments | Where-Object {
+                          $_ -ceq $expectedEndpointArgument
+                        }).Count -ne 1) {
+                        throw 'The Maven argument manifest endpoint does not match COSMOS_ENDPOINT.'
                       }
 
                       foreach ($name in @(
@@ -861,8 +1070,10 @@ stages:
                         }
                       }
 
+                      $forbiddenJvmPropertyPattern =
+                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)(?:\s*=|\s|$)'
                       $forbiddenMavenConfigPattern =
-                        '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD))(?:\s*=|\s|$)|(?:^|\s)["'']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)'
+                        "$forbiddenJvmPropertyPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
@@ -897,15 +1108,8 @@ stages:
                       # This exact future sentinel must perform a real Cosmos data-plane
                       # operation using DefaultAzureCredential and fail (never skip) if
                       # endpoint, Azure CLI auth, RBAC, or fixtures are unavailable.
-                      # Keep dotted -D arguments quoted so PowerShell passes each
-                      # complete option to Maven.
-                      $verifyOutput = & mvn verify -Plive-cosmos `
-                        -pl multiclouddb-conformance -am `
-                        "-Dtest=LiveCosmosEntraAuthenticationTest#entraAuthenticationPerformsCreateReadDelete" `
-                        '-Dsurefire.failIfNoSpecifiedTests=false' `
-                        "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT" `
-                        '-Djunit.jupiter.execution.timeout.default=60s' `
-                        '-DtrimStackTrace=false' 2>&1
+                      # Splat the preflight-authored data array; never evaluate it as script.
+                      $verifyOutput = & mvn verify @liveMavenArguments 2>&1
                       $verifyExitCode = $LASTEXITCODE
                       $verifyOutput |
                         Where-Object {
