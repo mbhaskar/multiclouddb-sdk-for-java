@@ -5,8 +5,11 @@
 #   service connection and the multiclouddb-cosmos-live environment;
 # - configure resource-owned branch-control checks on both protected resources
 #   to require refs/heads/main and fail closed for unknown or unprotected refs;
-# - add an exclusive-lock check to that environment (this pipeline requests
-#   sequential lock behavior because today's tests use shared fixture names);
+# - add an exclusive-lock check to that environment. The starter uses
+#   administrator-selected shared fixture database/container resources and
+#   provides per-run item-key isolation only; serialized execution reduces
+#   collisions but does not provide resource-level isolation or crash-proof
+#   cleanup;
 # - grant this pipeline access to the approved OneES pool; do not authorize the
 #   live WIF service connection for jobs on alternate or queue-selectable pools;
 # - restrict manual runs and variable changes to trusted maintainers;
@@ -149,8 +152,10 @@ stages:
 
                       $forbiddenJvmPropertyPattern =
                         '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)(?:\s*=|\s|$)'
+                      $forbiddenJvmArgumentIndirectionPattern =
+                        '(?i)@\{[^}\r\n]+\}|(?:^|\s)["'']?@(?!\{)[^\s"'']+'
                       $forbiddenMavenConfigPattern =
-                        "$forbiddenJvmPropertyPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
                       foreach ($relativeConfigPath in @(
                           '.mvn/maven.config',
                           '.mvn/jvm.config')) {
@@ -282,12 +287,18 @@ stages:
                       lifecycle hooks, fields, helper members, or extra method annotations. The test
                       must use fully qualified com.multiclouddb.api config, provider, client, and
                       factory types to construct a live-specific MulticloudDbClientConfig whose only
-                      connection setting is System.getProperty("cosmos.endpoint"), with no key/auth
-                      entries; it must not call ConformanceConfig.forProvider(COSMOS), which defaults
-                      to the emulator key. Create the client in try-with-resources, delete the
-                      run-scoped item in finally, and fail rather than skip when endpoint, Azure CLI
-                      authentication, RBAC, or fixtures are unavailable. The profile must omit
-                      credential and endpoint injection and require cosmos.endpoint.
+                      connection setting is java.lang.System.getProperty("cosmos.endpoint"), with no
+                      key/auth entries; obtain the run-scoped key from the fully qualified
+                      com.multiclouddb.conformance.ConformanceHarness.uniqueKey helper. It must not
+                      call ConformanceConfig.forProvider(COSMOS), which defaults to the emulator key.
+                      Create the client in try-with-resources, use the administrator-selected shared
+                      fixture database/container, delete the exact run-scoped item in finally, and
+                      fail rather than skip when endpoint, Azure CLI authentication, RBAC, or
+                      fixtures are unavailable. This contract provides per-run item isolation only;
+                      it does not provide per-run resource provisioning or crash-proof cleanup. The
+                      profile must retain Maven's default test source and output directories, omit
+                      compiler/source/classpath substitutions, omit credential and endpoint
+                      injection, and require cosmos.endpoint.
                       '@
                           )
                         }
@@ -584,13 +595,13 @@ stages:
                                 'fully qualified com.multiclouddb.api.ProviderId.COSMOS selection')
                             }
                             $endpointConnectionPattern =
-                              '\.\s*connection\s*\(\s*"endpoint"\s*,\s*System\s*\.\s*getProperty\s*\(\s*"cosmos\.endpoint"\s*\)\s*\)'
+                              '\.\s*connection\s*\(\s*"endpoint"\s*,\s*java\s*\.\s*lang\s*\.\s*System\s*\.\s*getProperty\s*\(\s*"cosmos\.endpoint"\s*\)\s*\)'
                             if ($configCode -notmatch $endpointConnectionPattern `
                                 -or @([regex]::Matches(
                                   $configCode, '\.\s*connection\s*\(')).Count -ne 1 `
                                 -or $configCode -match '\.\s*auth\s*\(') {
                               $missingContract.Add(
-                                'one endpoint-only connection bound directly to System.getProperty("cosmos.endpoint") and no auth settings')
+                                'one endpoint-only connection bound directly to java.lang.System.getProperty("cosmos.endpoint") and no auth settings')
                             }
 
                             $factoryCallPattern =
@@ -625,12 +636,12 @@ stages:
                               }
                               $keyMatch = [regex]::Match(
                                   $sentinelMethodStructure,
-                                  '(?s)\b(?:var|MulticloudDbKey)\s+(?<key>\w+)\s*=\s*ConformanceHarness\s*\.\s*uniqueKey\s*\(')
+                                  '(?s)\b(?:var|MulticloudDbKey)\s+(?<key>\w+)\s*=\s*com\s*\.\s*multiclouddb\s*\.\s*conformance\s*\.\s*ConformanceHarness\s*\.\s*uniqueKey\s*\(')
                               if (-not $keyMatch.Success `
                                   -or (Get-JavaBraceDepth `
                                     $sentinelMethodStructure $keyMatch.Index) -ne 1) {
                                 $missingContract.Add(
-                                  'a method-level ConformanceHarness.uniqueKey run-scoped key')
+                                  'a method-level fully qualified com.multiclouddb.conformance.ConformanceHarness.uniqueKey run-scoped key')
                               } else {
                                 $keyName = [regex]::Escape($keyMatch.Groups['key'].Value)
                                 if (@([regex]::Matches(
@@ -731,16 +742,21 @@ stages:
                             $errors.Add(@"
                       LiveCosmosEntraAuthenticationTest#$sentinelMethod is missing required source
                       contract elements: $(($missingContract -join ', ')). The exact method must
-                      directly bind its sole endpoint to System.getProperty("cosmos.endpoint"),
-                      configure no key/auth entries, and use one unchanged fully qualified
-                      com.multiclouddb.api.ResourceAddress variable for its ordered
-                      create/read/verify/delete flow. It must delete in finally and guarantee client
-                      close with try-with-resources even when delete fails. The final class must
-                      contain no class/extension annotations, inheritance, lifecycle hooks, fields,
-                      helper members, or extra method annotations, and its config/provider/client/
-                      factory references must use the fully qualified com.multiclouddb.api types.
-                      These checks reject known unsafe/trivial sentinels; code review must still
-                      confirm live operation and cleanup semantics.
+                      directly bind its sole endpoint to
+                      java.lang.System.getProperty("cosmos.endpoint"), configure no key/auth entries,
+                      obtain its run-scoped key from the fully qualified
+                      com.multiclouddb.conformance.ConformanceHarness.uniqueKey helper, and use one
+                      unchanged fully qualified com.multiclouddb.api.ResourceAddress variable for its
+                      ordered create/read/verify/delete flow against the administrator-selected
+                      shared fixture database/container. It must delete the exact run-scoped item in
+                      finally and guarantee client close with try-with-resources even when delete
+                      fails. This is per-item isolation, not per-run resource provisioning or
+                      crash-proof cleanup. The final class must contain no class/extension
+                      annotations, inheritance, lifecycle hooks, fields, helper members, or extra
+                      method annotations, and its config/provider/client/factory references must use
+                      the fully qualified com.multiclouddb.api types. These checks reject known
+                      unsafe/trivial sentinels; code review must still confirm live operation and
+                      cleanup semantics.
                       "@
                       )
                           }
@@ -841,6 +857,73 @@ stages:
                       '@
                       )
                           } else {
+                            $conformanceBuild = $conformanceProjects[0].SelectSingleNode(
+                              "./*[local-name()='build']")
+                            $expectedTestSourceDirectory = [IO.Path]::GetFullPath(
+                              (Join-Path $trustedProjectBase `
+                                'multiclouddb-conformance/src/test/java'))
+                            $expectedTestOutputDirectory = [IO.Path]::GetFullPath(
+                              (Join-Path $trustedProjectBase `
+                                'multiclouddb-conformance/target/test-classes'))
+                            $effectiveTestSourceDirectory =
+                              $conformanceBuild.SelectSingleNode(
+                                "./*[local-name()='testSourceDirectory']")
+                            $effectiveTestOutputDirectory =
+                              $conformanceBuild.SelectSingleNode(
+                                "./*[local-name()='testOutputDirectory']")
+                            if ($null -eq $effectiveTestSourceDirectory `
+                                -or [IO.Path]::GetFullPath(
+                                  $effectiveTestSourceDirectory.InnerText) -cne
+                                  $expectedTestSourceDirectory `
+                                -or $null -eq $effectiveTestOutputDirectory `
+                                -or [IO.Path]::GetFullPath(
+                                  $effectiveTestOutputDirectory.InnerText) -cne
+                                  $expectedTestOutputDirectory) {
+                              $errors.Add(@'
+                      The activated multiclouddb-conformance build must retain Maven's canonical
+                      src/test/java source directory and target/test-classes output directory. The
+                      preflight validates the canonical sentinel source and cannot approve an
+                      alternate source tree or compiled-test output.
+                      '@
+                              )
+                            }
+
+                            $unsupportedTestPathNodes = @(
+                              $conformanceBuild.SelectNodes(
+                                "./*[local-name()='plugins']/*[local-name()='plugin']" +
+                                "[normalize-space(*[local-name()='artifactId'])=" +
+                                "'maven-surefire-plugin']" +
+                                "//*[local-name()='testClassesDirectory' or " +
+                                "local-name()='additionalClasspathElements' or " +
+                                "local-name()='additionalClasspathDependencies' or " +
+                                "local-name()='dependenciesToScan']"),
+                              $conformanceBuild.SelectNodes(
+                                "./*[local-name()='plugins']/*[local-name()='plugin']" +
+                                "[normalize-space(*[local-name()='artifactId'])=" +
+                                "'maven-compiler-plugin']" +
+                                "//*[local-name()='compileSourceRoots' or " +
+                                "local-name()='outputDirectory' or " +
+                                "local-name()='testIncludes' or " +
+                                "local-name()='testExcludes' or " +
+                                "local-name()='includes' or " +
+                                "local-name()='excludes']"),
+                              $conformanceBuild.SelectNodes(
+                                "./*[local-name()='plugins']/*[local-name()='plugin']" +
+                                "[normalize-space(*[local-name()='artifactId'])=" +
+                                "'build-helper-maven-plugin']" +
+                                "//*[local-name()='goal' and " +
+                                "normalize-space(.)='add-test-source']")
+                            ) | ForEach-Object { @($_) }
+                            if (@($unsupportedTestPathNodes).Count -ne 0) {
+                              $errors.Add(@'
+                      The activated multiclouddb-conformance build contains unsupported test
+                      source, compiler-selection, output, or classpath substitutions. The starter
+                      supports only Maven's canonical test source/output path so the source contract
+                      is bound to the class selected by Surefire.
+                      '@
+                              )
+                            }
+
                             $forbiddenSystemPropertyNames = @(
                               'cosmos.key',
                               'cosmos.endpoint',
@@ -849,13 +932,23 @@ stages:
                               'jdk.tls.disabledAlgorithms',
                               'jdk.certpath.disabledAlgorithms',
                               'java.security.properties',
-                              'AZURE_TOKEN_CREDENTIALS'
+                              'AZURE_TOKEN_CREDENTIALS',
+                              'AZURE_CLIENT_SECRET',
+                              'AZURE_CLIENT_CERTIFICATE_PATH',
+                              'AZURE_CLIENT_CERTIFICATE_PASSWORD'
                             )
                             $forbiddenEnvironmentNames = @(
                               'cosmos.key',
                               'cosmos.endpoint',
                               'COSMOS_KEY',
                               'COSMOS_ENDPOINT',
+                              'AZURE_TOKEN_CREDENTIALS',
+                              'AZURE_CONFIG_DIR',
+                              'AZURE_CLIENT_SECRET',
+                              'AZURE_CLIENT_CERTIFICATE_PATH',
+                              'AZURE_CLIENT_CERTIFICATE_PASSWORD'
+                            )
+                            $requiredInheritedEnvironmentNames = @(
                               'AZURE_TOKEN_CREDENTIALS',
                               'AZURE_CONFIG_DIR'
                             )
@@ -922,7 +1015,8 @@ stages:
                                   foreach ($excludedName in @(
                                       $rawExcludedName -split '[,\s]+' |
                                       Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                                    if ($forbiddenEnvironmentNames -contains $excludedName) {
+                                    if ($requiredInheritedEnvironmentNames -contains
+                                        $excludedName) {
                                       $injections.Add(
                                         "excludedEnvironmentVariables/$excludedName")
                                     }
@@ -937,6 +1031,11 @@ stages:
                                   $injections.Add(
                                     'argLine/forbidden JVM property')
                                 }
+                                if ($argLine.InnerText -match
+                                    $forbiddenJvmArgumentIndirectionPattern) {
+                                  $injections.Add(
+                                    'argLine/unsupported JVM argument indirection')
+                                }
                               }
                             }
 
@@ -947,7 +1046,8 @@ stages:
                       emulator/key/endpoint/security-policy or identity-routing injection channels:
                       $injectionList. The test JVM must inherit AZURE_TOKEN_CREDENTIALS=
                       AzureCliCredential and AZURE_CONFIG_DIR from the protected AzureCLI task;
-                      Surefire must not override or exclude either variable.
+                      Surefire must not override or exclude either variable and must not inject
+                      client-secret or client-certificate credential variables.
                       multiclouddb-conformance/pom.xml currently declares emulator endpoint/key
                       injection in its own build/plugins, which a root-POM profile cannot override.
                       Declare live-cosmos in multiclouddb-conformance/pom.xml and replace that
@@ -1072,8 +1172,10 @@ stages:
 
                       $forbiddenJvmPropertyPattern =
                         '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)(?:\s*=|\s|$)'
+                      $forbiddenJvmArgumentIndirectionPattern =
+                        '(?i)@\{[^}\r\n]+\}|(?:^|\s)["'']?@(?!\{)[^\s"'']+'
                       $forbiddenMavenConfigPattern =
-                        "$forbiddenJvmPropertyPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
