@@ -110,9 +110,12 @@ stages:
                         'live-cosmos-effective-pom.xml'
                       $argumentManifest = Join-Path '$(Agent.TempDirectory)' `
                         'live-cosmos-maven-arguments.json'
+                      $providerDependencyClasspathFile = Join-Path `
+                        '$(Agent.TempDirectory)' 'live-cosmos-test-classpath.txt'
                       foreach ($stalePreflightArtifact in @(
                           $effectivePom,
-                          $argumentManifest)) {
+                          $argumentManifest,
+                          $providerDependencyClasspathFile)) {
                         if (Test-Path -LiteralPath $stalePreflightArtifact) {
                           Remove-Item -LiteralPath $stalePreflightArtifact `
                             -Force -ErrorAction Stop
@@ -154,8 +157,10 @@ stages:
                         '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)(?:\s*=|\s|$)'
                       $forbiddenJvmArgumentIndirectionPattern =
                         '(?i)@\{[^}\r\n]+\}|(?:^|\s)["'']?@(?!\{)[^\s"'']+'
+                      $forbiddenJvmExecutableOptionPattern =
+                        '(?i)(?:^|\s)["'']?(?:-javaagent:|-agentlib:|-agentpath:|-Xrun[^\s"'']*|-Xbootclasspath/a:|--(?:class-path|module-path|upgrade-module-path|patch-module)(?:=|\s+)|-(?:cp|classpath|p)(?:=|\s+)|-Djava\.system\.class\.loader(?:=|\s)|-XX:(?:OnError|OnOutOfMemoryError)=)'
                       $forbiddenMavenConfigPattern =
-                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
                       foreach ($relativeConfigPath in @(
                           '.mvn/maven.config',
                           '.mvn/jvm.config')) {
@@ -247,7 +252,8 @@ stages:
 
                       if ($errors.Count -eq 0) {
                         # Keep this data-only array identical for profile inspection,
-                        # effective-POM inspection, and the later WIF test execution.
+                        # effective-POM inspection, classpath preparation, and the
+                        # later WIF test execution.
                         $liveMavenArguments = @(
                           '-Plive-cosmos',
                           '-pl',
@@ -258,7 +264,9 @@ stages:
                           "-Dcosmos.endpoint=$endpoint",
                           '-Djunit.jupiter.execution.timeout.default=60s',
                           '-DtrimStackTrace=false',
-                          "-Doutput=$effectivePom"
+                          "-Doutput=$effectivePom",
+                          '-DincludeScope=test',
+                          "-Dmdep.outputFile=$providerDependencyClasspathFile"
                         )
                         $profilesOutput = & mvn help:active-profiles `
                           @liveMavenArguments 2>&1
@@ -298,7 +306,11 @@ stages:
                       it does not provide per-run resource provisioning or crash-proof cleanup. The
                       profile must retain Maven's default test source and output directories, omit
                       compiler/source/classpath substitutions, omit credential and endpoint
-                      injection, and require cosmos.endpoint.
+                      injection, and require cosmos.endpoint. The sentinel must not mutate system or
+                      Java security properties. Its compiled test classpath must discover exactly
+                      the production com.multiclouddb.provider.cosmos.CosmosProviderAdapter from the
+                      multiclouddb-provider-cosmos build output; test, generated, or dependency
+                      ServiceLoader registrations are unsupported.
                       '@
                           )
                         }
@@ -558,6 +570,28 @@ stages:
                             $missingContract.Add(
                               'no conditional, loop, catch, synchronized, assertDoesNotThrow, or lambda wrappers')
                           }
+                          $forbiddenSystemPropertyAccessPattern =
+                            '(?x)(?:java\s*\.\s*lang\s*\.\s*)?System\s*(?:\.|::)\s*(?:setProperty|clearProperty|setProperties|getProperties)\b|(?<![\w.])(?:setProperty|clearProperty|setProperties|getProperties)\s*\('
+                          $forbiddenSecurityRuntimePattern =
+                            '(?x)(?:java\s*\.\s*security\s*\.\s*)?Security\s*(?:\.|::)\s*(?:setProperty|addProvider|insertProviderAt|removeProvider)\b|(?<![\w.])(?:addProvider|insertProviderAt|removeProvider)\s*\('
+                          $forbiddenSystemStaticImportPattern =
+                            '(?m)^\s*import\s+static\s+java\.lang\.System\.(?:setProperty|clearProperty|setProperties|getProperties|\*)\s*;'
+                          $forbiddenSecurityStaticImportPattern =
+                            '(?m)^\s*import\s+static\s+java\.security\.Security\.(?:setProperty|addProvider|insertProviderAt|removeProvider|\*)\s*;'
+                          if ($sentinelStructure -match
+                                $forbiddenSystemStaticImportPattern `
+                              -or $sentinelMethodStructure -match
+                                $forbiddenSystemPropertyAccessPattern) {
+                            $missingContract.Add(
+                              'no System property mutation or mutable System.getProperties access')
+                          }
+                          if ($sentinelStructure -match
+                                $forbiddenSecurityStaticImportPattern `
+                              -or $sentinelMethodStructure -match
+                                $forbiddenSecurityRuntimePattern) {
+                            $missingContract.Add(
+                              'no java.security.Security runtime policy/provider mutation')
+                          }
                           $apiPrefix =
                             'com\s*\.\s*multiclouddb\s*\.\s*api\s*\.'
                           $configTypePattern =
@@ -754,9 +788,11 @@ stages:
                       crash-proof cleanup. The final class must contain no class/extension
                       annotations, inheritance, lifecycle hooks, fields, helper members, or extra
                       method annotations, and its config/provider/client/factory references must use
-                      the fully qualified com.multiclouddb.api types. These checks reject known
-                      unsafe/trivial sentinels; code review must still confirm live operation and
-                      cleanup semantics.
+                      the fully qualified com.multiclouddb.api types. It must not mutate System
+                      properties or Java security policy/provider state. These checks and the
+                      pre-test ServiceLoader probe reject known unsafe/trivial substitutions; they
+                      are not an arbitrary-Java/plugin sandbox, so trusted-source review must still
+                      confirm live operation and cleanup semantics.
                       "@
                       )
                           }
@@ -912,7 +948,13 @@ stages:
                                 "[normalize-space(*[local-name()='artifactId'])=" +
                                 "'build-helper-maven-plugin']" +
                                 "//*[local-name()='goal' and " +
-                                "normalize-space(.)='add-test-source']")
+                                "normalize-space(.)='add-test-source']"),
+                              $conformanceBuild.SelectNodes(
+                                "./*[local-name()='plugins']/*[local-name()='plugin']" +
+                                "[normalize-space(*[local-name()='artifactId'])=" +
+                                "'maven-resources-plugin']" +
+                                "//*[local-name()='goal' and " +
+                                "normalize-space(.)='copy-resources']")
                             ) | ForEach-Object { @($_) }
                             if (@($unsupportedTestPathNodes).Count -ne 0) {
                               $errors.Add(@'
@@ -1032,9 +1074,11 @@ stages:
                                     'argLine/forbidden JVM property')
                                 }
                                 if ($argLine.InnerText -match
-                                    $forbiddenJvmArgumentIndirectionPattern) {
+                                    $forbiddenJvmArgumentIndirectionPattern `
+                                    -or $argLine.InnerText -match
+                                      $forbiddenJvmExecutableOptionPattern) {
                                   $injections.Add(
-                                    'argLine/unsupported JVM argument indirection')
+                                    'argLine/unsupported JVM argument indirection or executable option')
                                 }
                               }
                             }
@@ -1132,6 +1176,17 @@ stages:
                         }).Count -ne 1) {
                         throw 'The Maven argument manifest endpoint does not match COSMOS_ENDPOINT.'
                       }
+                      $providerDependencyClasspathFile = Join-Path `
+                        '$(Agent.TempDirectory)' 'live-cosmos-test-classpath.txt'
+                      foreach ($expectedClasspathArgument in @(
+                          '-DincludeScope=test',
+                          "-Dmdep.outputFile=$providerDependencyClasspathFile")) {
+                        if (@($liveMavenArguments | Where-Object {
+                            $_ -ceq $expectedClasspathArgument
+                          }).Count -ne 1) {
+                          throw "The Maven argument manifest is missing the exact '$expectedClasspathArgument' classpath-probe setting."
+                        }
+                      }
 
                       foreach ($name in @(
                           'COSMOS_KEY',
@@ -1174,8 +1229,10 @@ stages:
                         '(?i)(?<![A-Za-z0-9_.])(?:-D)?(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)(?:\s*=|\s|$)'
                       $forbiddenJvmArgumentIndirectionPattern =
                         '(?i)@\{[^}\r\n]+\}|(?:^|\s)["'']?@(?!\{)[^\s"'']+'
+                      $forbiddenJvmExecutableOptionPattern =
+                        '(?i)(?:^|\s)["'']?(?:-javaagent:|-agentlib:|-agentpath:|-Xrun[^\s"'']*|-Xbootclasspath/a:|--(?:class-path|module-path|upgrade-module-path|patch-module)(?:=|\s+)|-(?:cp|classpath|p)(?:=|\s+)|-Djava\.system\.class\.loader(?:=|\s)|-XX:(?:OnError|OnOutOfMemoryError)=)'
                       $forbiddenMavenConfigPattern =
-                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
@@ -1205,6 +1262,121 @@ stages:
                       $extensionsPath = Join-Path $trustedProjectBase '.mvn/extensions.xml'
                       if (Test-Path -LiteralPath $extensionsPath) {
                         throw "Maven core extension file '.mvn/extensions.xml' is not permitted in the live WIF pipeline."
+                      }
+
+                      if (Test-Path -LiteralPath `
+                          $providerDependencyClasspathFile) {
+                        Remove-Item -LiteralPath `
+                          $providerDependencyClasspathFile `
+                          -Force -ErrorAction Stop
+                      }
+                      if (Test-Path -LiteralPath `
+                          $providerDependencyClasspathFile) {
+                        throw 'Stale live test dependency classpath could not be removed.'
+                      }
+                      $compileOutput = & mvn process-test-classes `
+                        org.apache.maven.plugins:maven-dependency-plugin:3.7.0:build-classpath `
+                        @liveMavenArguments 2>&1
+                      $compileExitCode = $LASTEXITCODE
+                      $compileOutput |
+                        Where-Object {
+                          $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
+                        } |
+                        ForEach-Object { Write-Host $_ }
+                      if ($compileExitCode -ne 0) {
+                        throw "Live Cosmos DB test classpath preparation failed with Maven exit code $compileExitCode."
+                      }
+                      if (-not (Test-Path -LiteralPath `
+                          $providerDependencyClasspathFile -PathType Leaf)) {
+                        throw 'Maven did not produce the live test dependency classpath.'
+                      }
+
+                      $cosmosProviderClasses = Join-Path $trustedProjectBase `
+                        'multiclouddb-provider-cosmos/target/classes'
+                      $candidateProviderClasspathEntries = @(
+                        (Join-Path $trustedProjectBase `
+                          'multiclouddb-conformance/target/test-classes'),
+                        (Join-Path $trustedProjectBase `
+                          'multiclouddb-conformance/target/classes')
+                      )
+                      $resolvedDependencyClasspath = (
+                        Get-Content -LiteralPath `
+                          $providerDependencyClasspathFile -Raw).Trim()
+                      if ([string]::IsNullOrWhiteSpace(
+                          $resolvedDependencyClasspath)) {
+                        throw 'Maven produced an empty live test dependency classpath.'
+                      }
+                      $candidateProviderClasspathEntries +=
+                        $resolvedDependencyClasspath -split `
+                          [regex]::Escape([IO.Path]::PathSeparator)
+                      $seenProviderClasspathEntries =
+                        [Collections.Generic.HashSet[string]]::new(
+                          [StringComparer]::Ordinal)
+                      $providerClasspathEntries = @(
+                        foreach ($classpathEntry in `
+                            $candidateProviderClasspathEntries) {
+                          if ([string]::IsNullOrWhiteSpace($classpathEntry)) {
+                            continue
+                          }
+                          if (-not (Test-Path -LiteralPath $classpathEntry)) {
+                            throw "Required provider probe classpath entry is missing: $classpathEntry"
+                          }
+                          $resolvedClasspathEntry = (
+                            Resolve-Path -LiteralPath $classpathEntry).Path
+                          if ($seenProviderClasspathEntries.Add(
+                              $resolvedClasspathEntry)) {
+                            $resolvedClasspathEntry
+                          }
+                        }
+                      )
+                      if ($providerClasspathEntries.Count -eq 0) {
+                        throw 'The live test provider probe classpath is empty.'
+                      }
+                      $providerProbeSource = Join-Path '$(Agent.TempDirectory)' `
+                        'LiveCosmosProviderProbe.java'
+                      @'
+                      import com.multiclouddb.api.ProviderId;
+                      import com.multiclouddb.spi.MulticloudDbProviderAdapter;
+                      import java.nio.file.Path;
+                      import java.util.ArrayList;
+                      import java.util.List;
+                      import java.util.ServiceLoader;
+
+                      public final class LiveCosmosProviderProbe {
+                        public static void main(String[] args) throws Exception {
+                          Path expectedLocation = Path.of(args[0]).toRealPath();
+                          List<String> cosmosAdapters = new ArrayList<>();
+                          for (MulticloudDbProviderAdapter adapter :
+                              ServiceLoader.load(MulticloudDbProviderAdapter.class)) {
+                            if (adapter.providerId() == ProviderId.COSMOS) {
+                              Path actualLocation = Path.of(adapter.getClass()
+                                  .getProtectionDomain().getCodeSource().getLocation().toURI())
+                                  .toRealPath();
+                              cosmosAdapters.add(adapter.getClass().getName()
+                                  + "@" + actualLocation);
+                            }
+                          }
+                          List<String> expected = List.of(
+                              "com.multiclouddb.provider.cosmos.CosmosProviderAdapter"
+                                  + "@" + expectedLocation);
+                          if (!cosmosAdapters.equals(expected)) {
+                            throw new IllegalStateException(
+                                "Unexpected Cosmos provider adapters: " + cosmosAdapters);
+                          }
+                          System.out.println("Validated production Cosmos provider adapter.");
+                        }
+                      }
+                      '@ | Set-Content -LiteralPath $providerProbeSource `
+                        -Encoding utf8NoBOM
+                      $providerClasspath = $providerClasspathEntries -join `
+                        [IO.Path]::PathSeparator
+                      $providerProbeOutput = & java --class-path `
+                        $providerClasspath $providerProbeSource `
+                        $cosmosProviderClasses 2>&1
+                      $providerProbeExitCode = $LASTEXITCODE
+                      $providerProbeOutput | ForEach-Object { Write-Host $_ }
+                      if ($providerProbeExitCode -ne 0) {
+                        throw 'The live test classpath must discover exactly the production CosmosProviderAdapter from multiclouddb-provider-cosmos/target/classes. Test, generated, or dependency ServiceLoader providers are unsupported.'
                       }
 
                       # This exact future sentinel must perform a real Cosmos data-plane
