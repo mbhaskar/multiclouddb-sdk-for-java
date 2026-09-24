@@ -159,8 +159,12 @@ stages:
                         '(?i)@\{[^}\r\n]+\}|(?:^|\s)["'']?@(?!\{)[^\s"'']+'
                       $forbiddenJvmExecutableOptionPattern =
                         '(?i)(?:^|\s)["'']?(?:-javaagent:|-agentlib:|-agentpath:|-Xrun[^\s"'']*|-Xbootclasspath/a:|--(?:class-path|module-path|upgrade-module-path|patch-module)(?:=|\s+)|-(?:cp|classpath|p)(?:=|\s+)|-Djava\.system\.class\.loader(?:=|\s)|-XX:(?:OnError|OnOutOfMemoryError)=)'
+                      $forbiddenNestedJvmConfigPattern =
+                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|(?:^|\s)[""']?-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                      $forbiddenMavenRepositoryRedirectPattern =
+                        '(?i)(?:^|\s)["'']?(?:-D\s*|--define(?:=|\s+))["'']?maven\.repo\.local(?:\s*=|\s|$)'
                       $forbiddenMavenConfigPattern =
-                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                        "$forbiddenNestedJvmConfigPattern|$forbiddenMavenRepositoryRedirectPattern"
                       foreach ($relativeConfigPath in @(
                           '.mvn/maven.config',
                           '.mvn/jvm.config')) {
@@ -623,10 +627,16 @@ stages:
                             }
                             $configCode = $sentinelMethodStructure.Substring(
                               $configMatch.Index, $configMatch.Length)
-                            if ($configMatch.Groups['chain'].Value -notmatch
-                                "\.\s*provider\s*\(\s*$providerTypePattern\s*\.\s*COSMOS\s*\)") {
+                            $providerInvocations = @([regex]::Matches(
+                              $configMatch.Groups['chain'].Value,
+                              '\.\s*provider\s*\('))
+                            $cosmosProviderInvocations = @([regex]::Matches(
+                              $configMatch.Groups['chain'].Value,
+                              "\.\s*provider\s*\(\s*$providerTypePattern\s*\.\s*COSMOS\s*\)"))
+                            if ($providerInvocations.Count -ne 1 `
+                                -or $cosmosProviderInvocations.Count -ne 1) {
                               $missingContract.Add(
-                                'fully qualified com.multiclouddb.api.ProviderId.COSMOS selection')
+                                'exactly one provider invocation selecting fully qualified com.multiclouddb.api.ProviderId.COSMOS')
                             }
                             $endpointConnectionPattern =
                               '\.\s*connection\s*\(\s*"endpoint"\s*,\s*java\s*\.\s*lang\s*\.\s*System\s*\.\s*getProperty\s*\(\s*"cosmos\.endpoint"\s*\)\s*\)'
@@ -777,7 +787,8 @@ stages:
                       LiveCosmosEntraAuthenticationTest#$sentinelMethod is missing required source
                       contract elements: $(($missingContract -join ', ')). The exact method must
                       directly bind its sole endpoint to
-                      java.lang.System.getProperty("cosmos.endpoint"), configure no key/auth entries,
+                      java.lang.System.getProperty("cosmos.endpoint"), invoke provider exactly once
+                      with fully qualified com.multiclouddb.api.ProviderId.COSMOS, configure no key/auth entries,
                       obtain its run-scoped key from the fully qualified
                       com.multiclouddb.conformance.ConformanceHarness.uniqueKey helper, and use one
                       unchanged fully qualified com.multiclouddb.api.ResourceAddress variable for its
@@ -1036,7 +1047,7 @@ stages:
                                     }
                                     if ($forbiddenOptionVariables -contains $entryName `
                                         -and $entry.InnerText -match
-                                          $forbiddenMavenConfigPattern) {
+                                          $forbiddenNestedJvmConfigPattern) {
                                       $injections.Add(
                                         "environmentVariables/$entryName content")
                                     }
@@ -1231,8 +1242,12 @@ stages:
                         '(?i)@\{[^}\r\n]+\}|(?:^|\s)["'']?@(?!\{)[^\s"'']+'
                       $forbiddenJvmExecutableOptionPattern =
                         '(?i)(?:^|\s)["'']?(?:-javaagent:|-agentlib:|-agentpath:|-Xrun[^\s"'']*|-Xbootclasspath/a:|--(?:class-path|module-path|upgrade-module-path|patch-module)(?:=|\s+)|-(?:cp|classpath|p)(?:=|\s+)|-Djava\.system\.class\.loader(?:=|\s)|-XX:(?:OnError|OnOutOfMemoryError)=)'
+                      $forbiddenNestedJvmConfigPattern =
+                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|(?:^|\s)[""']?-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                      $forbiddenMavenRepositoryRedirectPattern =
+                        '(?i)(?:^|\s)["'']?(?:-D\s*|--define(?:=|\s+))["'']?maven\.repo\.local(?:\s*=|\s|$)'
                       $forbiddenMavenConfigPattern =
-                        "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|-Dmaven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)(?:\s*=|\s|$)"
+                        "$forbiddenNestedJvmConfigPattern|$forbiddenMavenRepositoryRedirectPattern"
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
