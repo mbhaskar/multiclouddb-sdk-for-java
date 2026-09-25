@@ -165,6 +165,20 @@ stages:
                         '(?i)(?:^|\s)["'']?(?:-D\s*|--define(?:=|\s+))["'']?maven\.repo\.local(?:\s*=|\s|$)'
                       $forbiddenMavenConfigPattern =
                         "$forbiddenNestedJvmConfigPattern|$forbiddenMavenRepositoryRedirectPattern"
+                      $forbiddenSurefireExecutionPropertyPattern =
+                        '(?im)(?:^|\s)["'']?(?:-D\s*|--define(?:=|\s+))["'']?(?:argLine|jvm|maven\.surefire\.debug)(?:\s*=|\s|$)'
+                      function Test-ForbiddenMavenConfiguration {
+                        param([string]$Value)
+                        if ([string]::IsNullOrWhiteSpace($Value)) {
+                          return $false
+                        }
+                        if ($Value -match $forbiddenMavenConfigPattern `
+                            -or $Value -match
+                              $forbiddenSurefireExecutionPropertyPattern) {
+                          return $true
+                        }
+                        return $false
+                      }
                       foreach ($relativeConfigPath in @(
                           '.mvn/maven.config',
                           '.mvn/jvm.config')) {
@@ -172,7 +186,7 @@ stages:
                         if (Test-Path -LiteralPath $configPath -PathType Leaf) {
                           Write-Host "Inspecting Maven configuration file: $relativeConfigPath"
                           $configText = Get-Content -LiteralPath $configPath -Raw
-                          if ($configText -match $forbiddenMavenConfigPattern) {
+                          if (Test-ForbiddenMavenConfiguration $configText) {
                             $errors.Add(
                               "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or security-policy injection.")
                           }
@@ -248,7 +262,7 @@ stages:
                       foreach ($name in $forbiddenOptionVariables) {
                         $value = [Environment]::GetEnvironmentVariable($name)
                         if (-not [string]::IsNullOrWhiteSpace($value) `
-                            -and $value -match $forbiddenMavenConfigPattern) {
+                            -and (Test-ForbiddenMavenConfiguration $value)) {
                           $errors.Add(
                             "Environment variable '$name' contains forbidden Maven/JVM injection.")
                         }
@@ -311,10 +325,10 @@ stages:
                       profile must retain Maven's default test source and output directories, omit
                       compiler/source/classpath substitutions, omit credential and endpoint
                       injection, and require cosmos.endpoint. The sentinel must not mutate system or
-                      Java security properties. Its compiled test classpath must discover exactly
-                      the production com.multiclouddb.provider.cosmos.CosmosProviderAdapter from the
-                      multiclouddb-provider-cosmos build output; test, generated, or dependency
-                      ServiceLoader registrations are unsupported.
+                      Java security properties. Its compiled test classpath must contain only the
+                      production Cosmos, Dynamo, and Spanner SPI descriptors/classes from their
+                      canonical reactor build outputs; test, generated, shadowed, malformed,
+                      duplicate, or dependency provider registrations are unsupported.
                       '@
                           )
                         }
@@ -801,9 +815,10 @@ stages:
                       method annotations, and its config/provider/client/factory references must use
                       the fully qualified com.multiclouddb.api types. It must not mutate System
                       properties or Java security policy/provider state. These checks and the
-                      pre-test ServiceLoader probe reject known unsafe/trivial substitutions; they
-                      are not an arbitrary-Java/plugin sandbox, so trusted-source review must still
-                      confirm live operation and cleanup semantics.
+                      pre-test data-only SPI descriptor/class-origin validation reject known
+                      unsafe/trivial substitutions without loading provider classes. They are not
+                      an arbitrary-Java/plugin sandbox, so trusted-source review must still confirm
+                      live operation and cleanup semantics.
                       "@
                       )
                           }
@@ -838,7 +853,7 @@ stages:
                           foreach ($name in $forbiddenOptionVariables) {
                             $value = [Environment]::GetEnvironmentVariable($name)
                             if (-not [string]::IsNullOrWhiteSpace($value) `
-                                -and $value -match $forbiddenMavenConfigPattern) {
+                                -and (Test-ForbiddenMavenConfiguration $value)) {
                               $errors.Add(
                                 "Environment variable '$name' contains forbidden Maven/JVM injection.")
                             }
@@ -850,7 +865,7 @@ stages:
                             if (Test-Path -LiteralPath $configPath -PathType Leaf) {
                               Write-Host "Rechecking Maven configuration file: $relativeConfigPath"
                               $configText = Get-Content -LiteralPath $configPath -Raw
-                              if ($configText -match $forbiddenMavenConfigPattern) {
+                              if (Test-ForbiddenMavenConfiguration $configText) {
                                 $errors.Add(
                                   "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or security-policy injection.")
                               }
@@ -1092,6 +1107,16 @@ stages:
                                     'argLine/unsupported JVM argument indirection or executable option')
                                 }
                               }
+                              foreach ($executionOverride in @(
+                                  $plugin.SelectNodes(
+                                    ".//*[local-name()='jvm' or " +
+                                    "local-name()='debugForkedProcess']"))) {
+                                if (-not [string]::IsNullOrWhiteSpace(
+                                    $executionOverride.InnerText)) {
+                                  $injections.Add(
+                                    "$($executionOverride.LocalName)/unsupported Surefire JVM execution override")
+                                }
+                              }
                             }
 
                             if ($injections.Count -ne 0) {
@@ -1248,6 +1273,20 @@ stages:
                         '(?i)(?:^|\s)["'']?(?:-D\s*|--define(?:=|\s+))["'']?maven\.repo\.local(?:\s*=|\s|$)'
                       $forbiddenMavenConfigPattern =
                         "$forbiddenNestedJvmConfigPattern|$forbiddenMavenRepositoryRedirectPattern"
+                      $forbiddenSurefireExecutionPropertyPattern =
+                        '(?im)(?:^|\s)["'']?(?:-D\s*|--define(?:=|\s+))["'']?(?:argLine|jvm|maven\.surefire\.debug)(?:\s*=|\s|$)'
+                      function Test-ForbiddenMavenConfiguration {
+                        param([string]$Value)
+                        if ([string]::IsNullOrWhiteSpace($Value)) {
+                          return $false
+                        }
+                        if ($Value -match $forbiddenMavenConfigPattern `
+                            -or $Value -match
+                              $forbiddenSurefireExecutionPropertyPattern) {
+                          return $true
+                        }
+                        return $false
+                      }
                       foreach ($name in @(
                           'JAVA_TOOL_OPTIONS',
                           '_JAVA_OPTIONS',
@@ -1257,7 +1296,7 @@ stages:
                           'MAVEN_ARGS')) {
                         $value = [Environment]::GetEnvironmentVariable($name)
                         if (-not [string]::IsNullOrWhiteSpace($value) `
-                            -and $value -match $forbiddenMavenConfigPattern) {
+                            -and (Test-ForbiddenMavenConfiguration $value)) {
                           throw "Environment variable '$name' contains forbidden Maven/JVM injection."
                         }
                       }
@@ -1269,7 +1308,7 @@ stages:
                         if (Test-Path -LiteralPath $configPath -PathType Leaf) {
                           Write-Host "Inspecting Maven configuration file: $relativeConfigPath"
                           $configText = Get-Content -LiteralPath $configPath -Raw
-                          if ($configText -match $forbiddenMavenConfigPattern) {
+                          if (Test-ForbiddenMavenConfiguration $configText) {
                             throw "Maven configuration file '$relativeConfigPath' contains forbidden project, credential, endpoint, or security-policy injection."
                           }
                         }
@@ -1306,14 +1345,17 @@ stages:
                         throw 'Maven did not produce the live test dependency classpath.'
                       }
 
-                      $cosmosProviderClasses = Join-Path $trustedProjectBase `
-                        'multiclouddb-provider-cosmos/target/classes'
                       $candidateProviderClasspathEntries = @(
                         (Join-Path $trustedProjectBase `
-                          'multiclouddb-conformance/target/test-classes'),
-                        (Join-Path $trustedProjectBase `
-                          'multiclouddb-conformance/target/classes')
+                          'multiclouddb-conformance/target/test-classes')
                       )
+                      $conformanceMainClasses = Join-Path `
+                        $trustedProjectBase `
+                        'multiclouddb-conformance/target/classes'
+                      if (Test-Path -LiteralPath $conformanceMainClasses) {
+                        $candidateProviderClasspathEntries +=
+                          $conformanceMainClasses
+                      }
                       $resolvedDependencyClasspath = (
                         Get-Content -LiteralPath `
                           $providerDependencyClasspathFile -Raw).Trim()
@@ -1347,52 +1389,312 @@ stages:
                       if ($providerClasspathEntries.Count -eq 0) {
                         throw 'The live test provider probe classpath is empty.'
                       }
-                      $providerProbeSource = Join-Path '$(Agent.TempDirectory)' `
-                        'LiveCosmosProviderProbe.java'
-                      @'
-                      import com.multiclouddb.api.ProviderId;
-                      import com.multiclouddb.spi.MulticloudDbProviderAdapter;
-                      import java.nio.file.Path;
-                      import java.util.ArrayList;
-                      import java.util.List;
-                      import java.util.ServiceLoader;
+                      $providerServiceResource =
+                        'META-INF/services/com.multiclouddb.spi.MulticloudDbProviderAdapter'
+                      $approvedProviderModules = [ordered]@{
+                        'com.multiclouddb.provider.cosmos.CosmosProviderAdapter' =
+                          'multiclouddb-provider-cosmos'
+                        'com.multiclouddb.provider.dynamo.DynamoProviderAdapter' =
+                          'multiclouddb-provider-dynamo'
+                        'com.multiclouddb.provider.spanner.SpannerProviderAdapter' =
+                          'multiclouddb-provider-spanner'
+                      }
+                      $approvedProviderOrigins = [ordered]@{}
+                      foreach ($providerClassName in `
+                          $approvedProviderModules.Keys) {
+                        $providerClasses = Join-Path $trustedProjectBase `
+                          "$($approvedProviderModules[$providerClassName])/target/classes"
+                        if (-not (Test-Path -LiteralPath `
+                            $providerClasses -PathType Container)) {
+                          throw "Approved provider output is missing: $providerClasses"
+                        }
+                        $approvedProviderOrigins[$providerClassName] = (
+                          Resolve-Path -LiteralPath $providerClasses).Path
+                      }
 
-                      public final class LiveCosmosProviderProbe {
-                        public static void main(String[] args) throws Exception {
-                          Path expectedLocation = Path.of(args[0]).toRealPath();
-                          List<String> cosmosAdapters = new ArrayList<>();
-                          for (MulticloudDbProviderAdapter adapter :
-                              ServiceLoader.load(MulticloudDbProviderAdapter.class)) {
-                            if (adapter.providerId() == ProviderId.COSMOS) {
-                              Path actualLocation = Path.of(adapter.getClass()
-                                  .getProtectionDomain().getCodeSource().getLocation().toURI())
-                                  .toRealPath();
-                              cosmosAdapters.add(adapter.getClass().getName()
-                                  + "@" + actualLocation);
+                      Add-Type -AssemblyName System.IO.Compression.FileSystem
+                      $providerValidationErrors =
+                        [Collections.Generic.List[string]]::new()
+                      $providerRegistrationOrigins = @{}
+                      $firstProviderClassOrigins = @{}
+                      foreach ($classpathEntry in $providerClasspathEntries) {
+                        $descriptorTexts = @()
+                        $providerClassEntries = @{}
+                        if (Test-Path -LiteralPath `
+                            $classpathEntry -PathType Container) {
+                          $descriptorPath = Join-Path `
+                            $classpathEntry $providerServiceResource
+                          if (Test-Path -LiteralPath `
+                              $descriptorPath -PathType Leaf) {
+                            try {
+                              $descriptorTexts +=
+                                [IO.File]::ReadAllText(
+                                  $descriptorPath,
+                                  [Text.UTF8Encoding]::new($false, $true))
+                            } catch {
+                              $providerValidationErrors.Add(
+                                "Provider descriptor is not valid UTF-8: $descriptorPath")
                             }
                           }
-                          List<String> expected = List.of(
-                              "com.multiclouddb.provider.cosmos.CosmosProviderAdapter"
-                                  + "@" + expectedLocation);
-                          if (!cosmosAdapters.equals(expected)) {
-                            throw new IllegalStateException(
-                                "Unexpected Cosmos provider adapters: " + cosmosAdapters);
+                          foreach ($providerClassName in `
+                              $approvedProviderOrigins.Keys) {
+                            $providerClassPath = Join-Path $classpathEntry `
+                              ($providerClassName.Replace(
+                                '.', [IO.Path]::DirectorySeparatorChar) +
+                                '.class')
+                            if (Test-Path -LiteralPath `
+                                $providerClassPath -PathType Leaf) {
+                              $providerClassEntries[$providerClassName] = 1
+                            }
                           }
-                          System.out.println("Validated production Cosmos provider adapter.");
+                        } else {
+                          $archive = $null
+                          $isMultiReleaseArchive = $false
+                          try {
+                            $archive =
+                              [IO.Compression.ZipFile]::OpenRead(
+                                $classpathEntry)
+                            $manifestEntries = @($archive.Entries |
+                              Where-Object {
+                                $_.FullName -ieq 'META-INF/MANIFEST.MF'
+                              })
+                            if ($manifestEntries.Count -gt 1) {
+                              $providerValidationErrors.Add(
+                                "Classpath archive has duplicate manifests: $classpathEntry")
+                            }
+                            if ($manifestEntries.Count -eq 1) {
+                              $manifestStream = $manifestEntries[0].Open()
+                              try {
+                                $manifestReader = [IO.StreamReader]::new(
+                                  $manifestStream,
+                                  [Text.UTF8Encoding]::new($false, $true),
+                                  $true)
+                                try {
+                                  $manifestText =
+                                    $manifestReader.ReadToEnd()
+                                } finally {
+                                  $manifestReader.Dispose()
+                                }
+                                $manifestAttributes = @{}
+                                $currentManifestAttribute = $null
+                                foreach ($manifestLine in `
+                                    ($manifestText -split '\r\n|\n|\r')) {
+                                  if ($manifestLine.Length -eq 0) {
+                                    break
+                                  }
+                                  if ($manifestLine.StartsWith(' ')) {
+                                    if ($null -eq
+                                        $currentManifestAttribute) {
+                                      $providerValidationErrors.Add(
+                                        "Classpath archive has malformed manifest continuation: $classpathEntry")
+                                      continue
+                                    }
+                                    $manifestAttributes[
+                                      $currentManifestAttribute] +=
+                                      $manifestLine.Substring(1)
+                                    continue
+                                  }
+                                  $manifestSeparator =
+                                    $manifestLine.IndexOf(':')
+                                  if ($manifestSeparator -le 0) {
+                                    $providerValidationErrors.Add(
+                                      "Classpath archive has malformed manifest attribute: $classpathEntry")
+                                    $currentManifestAttribute = $null
+                                    continue
+                                  }
+                                  $manifestName = $manifestLine.Substring(
+                                    0, $manifestSeparator).Trim()
+                                  $manifestValue = $manifestLine.Substring(
+                                    $manifestSeparator + 1).TrimStart()
+                                  if ($manifestAttributes.ContainsKey(
+                                      $manifestName)) {
+                                    $providerValidationErrors.Add(
+                                      "Classpath archive has duplicate manifest attribute '$manifestName': $classpathEntry")
+                                  } else {
+                                    $manifestAttributes[$manifestName] =
+                                      $manifestValue
+                                  }
+                                  $currentManifestAttribute =
+                                    $manifestName
+                                }
+                                if ($manifestAttributes.ContainsKey(
+                                    'Class-Path') `
+                                    -and -not [string]::IsNullOrWhiteSpace(
+                                      $manifestAttributes['Class-Path'])) {
+                                  $providerValidationErrors.Add(
+                                    "Classpath archive has unsupported manifest Class-Path entries: $classpathEntry")
+                                }
+                                $isMultiReleaseArchive =
+                                  $manifestAttributes.ContainsKey(
+                                    'Multi-Release') `
+                                  -and $manifestAttributes[
+                                    'Multi-Release'].Trim() -ieq 'true'
+                              } catch {
+                                $providerValidationErrors.Add(
+                                  "Classpath archive manifest is not valid UTF-8: $classpathEntry")
+                              } finally {
+                                $manifestStream.Dispose()
+                              }
+                            }
+                            $serviceEntries = @($archive.Entries |
+                              Where-Object {
+                                $_.FullName -ceq $providerServiceResource
+                              })
+                            if ($serviceEntries.Count -gt 1) {
+                              $providerValidationErrors.Add(
+                                "Classpath archive has duplicate provider descriptors: $classpathEntry")
+                            }
+                            foreach ($serviceEntry in $serviceEntries) {
+                              $descriptorStream = $serviceEntry.Open()
+                              try {
+                                $descriptorReader = [IO.StreamReader]::new(
+                                  $descriptorStream,
+                                  [Text.UTF8Encoding]::new($false, $true),
+                                  $true)
+                                try {
+                                  $descriptorTexts +=
+                                    $descriptorReader.ReadToEnd()
+                                } finally {
+                                  $descriptorReader.Dispose()
+                                }
+                              } catch {
+                                $providerValidationErrors.Add(
+                                  "Provider descriptor is not valid UTF-8 in: $classpathEntry")
+                              } finally {
+                                $descriptorStream.Dispose()
+                              }
+                            }
+                            foreach ($providerClassName in `
+                                $approvedProviderOrigins.Keys) {
+                              $classResource =
+                                $providerClassName.Replace('.', '/') +
+                                '.class'
+                              $baseClassEntries = @($archive.Entries |
+                                Where-Object {
+                                  $_.FullName -ceq $classResource
+                                })
+                              if ($baseClassEntries.Count -gt 1) {
+                                $providerValidationErrors.Add(
+                                  "Classpath archive has duplicate provider class entries for $providerClassName`: $classpathEntry")
+                              }
+                              $versionedClassEntries = @()
+                              if ($isMultiReleaseArchive) {
+                                $versionedClassPattern =
+                                  '^META-INF/versions/(?<version>[0-9]+)/' +
+                                  [regex]::Escape($classResource) + '$'
+                                $versionedClassEntries = @(
+                                  foreach ($archiveEntry in `
+                                      $archive.Entries) {
+                                    $versionedClassMatch =
+                                      [regex]::Match(
+                                        $archiveEntry.FullName,
+                                        $versionedClassPattern)
+                                    if ($versionedClassMatch.Success) {
+                                      $version = [int]$versionedClassMatch.Groups['version'].Value
+                                      if ($version -ge 9 -and
+                                          $version -le 17) {
+                                        $archiveEntry
+                                      }
+                                    }
+                                  }
+                                )
+                                if ($versionedClassEntries.Count -ne 0) {
+                                  $providerValidationErrors.Add(
+                                    "Multi-release archive defines approved provider class '$providerClassName' for Java 17: $classpathEntry")
+                                }
+                              }
+                              if ($baseClassEntries.Count -ne 0 `
+                                  -or $versionedClassEntries.Count -ne 0) {
+                                $providerClassEntries[$providerClassName] =
+                                  $baseClassEntries.Count +
+                                  $versionedClassEntries.Count
+                              }
+                            }
+                          } catch {
+                            $providerValidationErrors.Add(
+                              "Provider classpath entry is not a readable archive: $classpathEntry")
+                          } finally {
+                            if ($null -ne $archive) {
+                              $archive.Dispose()
+                            }
+                          }
+                        }
+
+                        foreach ($providerClassName in `
+                            $providerClassEntries.Keys) {
+                          if (-not $firstProviderClassOrigins.ContainsKey(
+                              $providerClassName)) {
+                            $firstProviderClassOrigins[$providerClassName] =
+                              $classpathEntry
+                          }
+                        }
+                        foreach ($descriptorText in $descriptorTexts) {
+                          foreach ($descriptorLine in `
+                              ($descriptorText -split '\r\n|\n|\r')) {
+                            $providerName =
+                              ($descriptorLine -replace '#.*$', '').Trim()
+                            if ([string]::IsNullOrWhiteSpace($providerName)) {
+                              continue
+                            }
+                            if ($providerName -notmatch
+                                '^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$') {
+                              $providerValidationErrors.Add(
+                                "Malformed provider descriptor entry '$providerName' in: $classpathEntry")
+                              continue
+                            }
+                            if (-not $approvedProviderOrigins.Contains(
+                                $providerName)) {
+                              $providerValidationErrors.Add(
+                                "Unsupported provider registration '$providerName' in: $classpathEntry")
+                              continue
+                            }
+                            if ($providerRegistrationOrigins.ContainsKey(
+                                $providerName)) {
+                              $providerValidationErrors.Add(
+                                "Duplicate provider registration '$providerName' in: $classpathEntry")
+                              continue
+                            }
+                            $providerRegistrationOrigins[$providerName] =
+                              $classpathEntry
+                          }
                         }
                       }
-                      '@ | Set-Content -LiteralPath $providerProbeSource `
-                        -Encoding utf8NoBOM
-                      $providerClasspath = $providerClasspathEntries -join `
-                        [IO.Path]::PathSeparator
-                      $providerProbeOutput = & java --class-path `
-                        $providerClasspath $providerProbeSource `
-                        $cosmosProviderClasses 2>&1
-                      $providerProbeExitCode = $LASTEXITCODE
-                      $providerProbeOutput | ForEach-Object { Write-Host $_ }
-                      if ($providerProbeExitCode -ne 0) {
-                        throw 'The live test classpath must discover exactly the production CosmosProviderAdapter from multiclouddb-provider-cosmos/target/classes. Test, generated, or dependency ServiceLoader providers are unsupported.'
+
+                      foreach ($providerClassName in `
+                          $approvedProviderOrigins.Keys) {
+                        $approvedOrigin =
+                          $approvedProviderOrigins[$providerClassName]
+                        if (-not $providerRegistrationOrigins.ContainsKey(
+                            $providerClassName)) {
+                          $providerValidationErrors.Add(
+                            "Missing approved provider registration '$providerClassName'.")
+                        } elseif ($providerRegistrationOrigins[
+                            $providerClassName] -cne $approvedOrigin) {
+                          $providerValidationErrors.Add(
+                            "Provider registration '$providerClassName' must originate from: $approvedOrigin")
+                        }
+                        if (-not $firstProviderClassOrigins.ContainsKey(
+                            $providerClassName)) {
+                          $providerValidationErrors.Add(
+                            "Missing approved provider class '$providerClassName'.")
+                        } elseif ($firstProviderClassOrigins[
+                            $providerClassName] -cne $approvedOrigin) {
+                          $providerValidationErrors.Add(
+                            "The first classpath definition of '$providerClassName' must originate from: $approvedOrigin")
+                        }
                       }
+                      if ($providerValidationErrors.Count -ne 0) {
+                        throw @"
+                      The live test classpath provider metadata is invalid:
+                      $($providerValidationErrors -join [Environment]::NewLine)
+                      Only the production Cosmos, Dynamo, and Spanner provider registrations and
+                      classes from their canonical reactor target/classes outputs are permitted.
+                      Test, generated, shadowed, malformed, duplicate, or dependency provider
+                      registrations are unsupported.
+                      "@
+                      }
+                      Write-Host (
+                        'Validated production provider descriptors and class origins without loading provider classes.')
 
                       # This exact future sentinel must perform a real Cosmos data-plane
                       # operation using DefaultAzureCredential and fail (never skip) if
