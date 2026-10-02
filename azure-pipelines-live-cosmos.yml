@@ -102,6 +102,21 @@ stages:
                     workingDirectory: $(Build.SourcesDirectory)
                     script: |
                       $ErrorActionPreference = 'Stop'
+                      $mavenOutputSuppressionPattern =
+                        '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
+                      function Write-FilteredMavenOutput {
+                        param(
+                          [Parameter(Mandatory, ValueFromPipeline)]
+                          [AllowNull()]
+                          [object]$InputObject
+                        )
+                        process {
+                          if ("$InputObject" -notmatch
+                              $mavenOutputSuppressionPattern) {
+                            Write-Host $InputObject
+                          }
+                        }
+                      }
                       $errors = [System.Collections.Generic.List[string]]::new()
                       $endpoint = $env:COSMOS_ENDPOINT
                       $sentinelMethod =
@@ -286,22 +301,28 @@ stages:
                           '-DincludeScope=test',
                           "-Dmdep.outputFile=$providerDependencyClasspathFile"
                         )
-                        $profilesOutput = & mvn help:active-profiles `
-                          @liveMavenArguments 2>&1
+                        $profileMetadata =
+                          [System.Collections.Generic.List[string]]::new()
+                        & mvn help:active-profiles `
+                          @liveMavenArguments 2>&1 |
+                          ForEach-Object {
+                            if ("$_" -match
+                                '^(?:\[[A-Z]+\]\s+)?\s*-\s+\S+\s+\(source:') {
+                              $profileMetadata.Add("$_")
+                            }
+                            $_
+                          } |
+                          Write-FilteredMavenOutput
                         $profilesExitCode = $LASTEXITCODE
                         $profiles = if (Test-Path -LiteralPath $effectivePom -PathType Leaf) {
                           Get-Content -LiteralPath $effectivePom
                         } else {
-                          $profilesOutput
+                          $profileMetadata
                         }
                         # Maven returns exit code 0 for an unknown -P profile, so preserve
-                        # this exact profile-list check. Echoing help output is safe: it
-                        # contains profile metadata, not effective property values.
-                        $profilesOutput |
-                          Where-Object {
-                            $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
-                          } |
-                          ForEach-Object { Write-Host $_ }
+                        # this exact profile-list check. The filtered help output streams
+                        # immediately; only bounded profile source lines are retained when
+                        # the help goal does not produce its requested output file.
                         if ($profilesExitCode -ne 0) {
                           $errors.Add('Maven could not activate the live-cosmos profile; inspect the preflight log.')
                         } elseif (-not ($profiles | Select-String -Pattern '^(?:\[[A-Z]+\]\s+)?\s*-\s+live-cosmos\s+\(source:')) {
@@ -883,14 +904,10 @@ stages:
                           if (Test-Path -LiteralPath $effectivePom) {
                             Remove-Item -LiteralPath $effectivePom -Force -ErrorAction Stop
                           }
-                          $effectivePomOutput = & mvn help:effective-pom `
-                            @liveMavenArguments 2>&1
+                          & mvn help:effective-pom `
+                            @liveMavenArguments 2>&1 |
+                            Write-FilteredMavenOutput
                           $effectivePomExitCode = $LASTEXITCODE
-                          $effectivePomOutput |
-                            Where-Object {
-                              $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
-                            } |
-                            ForEach-Object { Write-Host $_ }
                           if ($effectivePomExitCode -ne 0 `
                               -or -not (Test-Path -LiteralPath $effectivePom)) {
                             $errors.Add('Maven could not produce the activated live-cosmos effective POM.')
@@ -1176,6 +1193,21 @@ stages:
                     # in the same task so DefaultAzureCredential can use AzureCliCredential.
                     inlineScript: |
                       $ErrorActionPreference = 'Stop'
+                      $mavenOutputSuppressionPattern =
+                        '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
+                      function Write-FilteredMavenOutput {
+                        param(
+                          [Parameter(Mandatory, ValueFromPipeline)]
+                          [AllowNull()]
+                          [object]$InputObject
+                        )
+                        process {
+                          if ("$InputObject" -notmatch
+                              $mavenOutputSuppressionPattern) {
+                            Write-Host $InputObject
+                          }
+                        }
+                      }
                       az account show --output none
                       if ($LASTEXITCODE -ne 0) {
                         throw 'The WIF service connection could not establish an Azure CLI session.'
@@ -1328,15 +1360,11 @@ stages:
                           $providerDependencyClasspathFile) {
                         throw 'Stale live test dependency classpath could not be removed.'
                       }
-                      $compileOutput = & mvn process-test-classes `
+                      & mvn process-test-classes `
                         org.apache.maven.plugins:maven-dependency-plugin:3.7.0:build-classpath `
-                        @liveMavenArguments 2>&1
+                        @liveMavenArguments 2>&1 |
+                        Write-FilteredMavenOutput
                       $compileExitCode = $LASTEXITCODE
-                      $compileOutput |
-                        Where-Object {
-                          $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
-                        } |
-                        ForEach-Object { Write-Host $_ }
                       if ($compileExitCode -ne 0) {
                         throw "Live Cosmos DB test classpath preparation failed with Maven exit code $compileExitCode."
                       }
@@ -1700,13 +1728,9 @@ stages:
                       # operation using DefaultAzureCredential and fail (never skip) if
                       # endpoint, Azure CLI auth, RBAC, or fixtures are unavailable.
                       # Splat the preflight-authored data array; never evaluate it as script.
-                      $verifyOutput = & mvn verify @liveMavenArguments 2>&1
+                      & mvn verify @liveMavenArguments 2>&1 |
+                        Write-FilteredMavenOutput
                       $verifyExitCode = $LASTEXITCODE
-                      $verifyOutput |
-                        Where-Object {
-                          $_ -notmatch '^(?:NOTE:\s*)?Picked up (?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS):'
-                        } |
-                        ForEach-Object { Write-Host $_ }
                       if ($verifyExitCode -ne 0) {
                         throw "Live Cosmos DB tests failed with Maven exit code $verifyExitCode."
                       }
