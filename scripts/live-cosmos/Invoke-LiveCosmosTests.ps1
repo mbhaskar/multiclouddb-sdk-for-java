@@ -34,31 +34,16 @@ if ($manifestValue -isnot [System.Array]) {
   throw 'The Maven argument manifest must decode to a JSON array.'
 }
 $liveMavenArguments = @($manifestValue)
-if ($liveMavenArguments.Count -eq 0 `
-    -or @($liveMavenArguments | Where-Object {
-      $_ -isnot [string] `
-        -or [string]::IsNullOrWhiteSpace($_)
-    }).Count -ne 0) {
-  throw 'The Maven argument manifest must be a non-empty string array.'
-}
-$expectedEndpointArgument =
-  "-Dcosmos.endpoint=$env:COSMOS_ENDPOINT"
-if (@($liveMavenArguments | Where-Object {
-    $_ -ceq $expectedEndpointArgument
-  }).Count -ne 1) {
-  throw 'The Maven argument manifest endpoint does not match COSMOS_ENDPOINT.'
+$expectedMavenArguments = @(
+  Get-LiveCosmosMavenArguments `
+    -Endpoint $env:COSMOS_ENDPOINT -TempDirectory $TempDirectory)
+if (-not (Test-ExactStringArray `
+    -Actual $liveMavenArguments `
+    -Expected $expectedMavenArguments)) {
+  throw 'The Maven argument manifest does not exactly match the expected ordered live test arguments.'
 }
 $providerDependencyClasspathFile = Join-Path `
   $TempDirectory 'live-cosmos-test-classpath.txt'
-foreach ($expectedClasspathArgument in @(
-    '-DincludeScope=test',
-    "-Dmdep.outputFile=$providerDependencyClasspathFile")) {
-  if (@($liveMavenArguments | Where-Object {
-      $_ -ceq $expectedClasspathArgument
-    }).Count -ne 1) {
-    throw "The Maven argument manifest is missing the exact '$expectedClasspathArgument' classpath-probe setting."
-  }
-}
 
 foreach ($name in @(
     'COSMOS_KEY',

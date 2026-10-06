@@ -163,6 +163,20 @@ function Assert-ProcessExited {
   throw $Message
 }
 
+function Resolve-FirstApplicationPath {
+  param(
+    [Parameter(Mandatory)]
+    [string]$Name
+  )
+  $command = Get-Command $Name -CommandType Application |
+    Select-Object -First 1
+  if ($null -eq $command `
+      -or [string]::IsNullOrWhiteSpace($command.Source)) {
+    throw "Required application '$Name' was not found."
+  }
+  return [string]$command.Source
+}
+
 function Write-ExecutableFile {
   param(
     [Parameter(Mandatory)]
@@ -831,6 +845,26 @@ wait "$child"
   Assert-True (-not (Test-ForbiddenMavenConfiguration `
       '-B -T1 -Xmx512m -DtrustStore=/tmp/trusted.jks')) `
     'Shared helper rejected benign process options.'
+  foreach ($quotedForbidden in @(
+      '-D"cosmos.key=fixture"',
+      '-D"cosmos.key"=fixture',
+      "-D'java.security.properties=/tmp/security.properties'",
+      "-D'java.security.properties'=/tmp/security.properties",
+      '-D"argLine=-javaagent:/tmp/fixture-agent.jar"',
+      '-D"argLine"=-javaagent:/tmp/fixture-agent.jar',
+      "--define='maven.surefire.debug=-agentlib:jdwp'",
+      "--define 'maven.surefire.debug'=-agentlib:jdwp",
+      '-D"maven.repo.local=/tmp/fixture-repository"',
+      '-D"maven.repo.local"=/tmp/fixture-repository',
+      '--define="maven.repo.local=/tmp/fixture-repository"',
+      '-D"maven.projectBasedir=/tmp/fixture-project"',
+      '-D"maven.projectBasedir"=/tmp/fixture-project')) {
+    Assert-True (Test-ForbiddenMavenConfiguration $quotedForbidden) `
+      "Shared helper accepted quoted forbidden property: $quotedForbidden"
+  }
+  Assert-True (-not (Test-ForbiddenMavenConfiguration `
+      '-D"fixture.benign"=value')) `
+    'Shared helper rejected a benign balanced quoted property.'
   Assert-True (
     '-Dmaven.repo.local=/tmp/repository' -notmatch
       $forbiddenNestedJvmConfigPattern) `
@@ -879,12 +913,43 @@ wait "$child"
     'Missing-profile preflight produced an authentication manifest.'
 
   Assert-ProviderOutputs
+  $commandTopology = Join-Path $script:TestRoot 'command topology'
+  $commandFirst = Join-Path $commandTopology 'first'
+  $commandSecond = Join-Path $commandTopology 'second'
+  New-Item -ItemType Directory -Path $commandFirst, $commandSecond `
+    -Force | Out-Null
+  foreach ($directory in @($commandFirst, $commandSecond)) {
+    Write-ExecutableFile -Path (Join-Path $directory 'mvn') `
+      -Content "#!/bin/sh`nexit 0`n"
+  }
+  $originalPath = $env:PATH
+  try {
+    $env:PATH = (
+      "$commandFirst$([IO.Path]::PathSeparator)" +
+      "$commandSecond$([IO.Path]::PathSeparator)$originalPath")
+    $resolvedTopologyMaven = Resolve-FirstApplicationPath 'mvn'
+    Assert-True ($resolvedTopologyMaven -ceq (
+        Join-Path $commandFirst 'mvn')) `
+      'Maven command selection did not match native PATH order.'
+    Write-Host 'PASS Maven command selection used the first PATH application.'
+  } finally {
+    $env:PATH = $originalPath
+  }
+
+  $checkedInFixture = Join-Path $PSScriptRoot `
+    'fixtures/live-cosmos-project'
+  Assert-True (@(Get-ChildItem -LiteralPath $checkedInFixture `
+        -Directory -Filter target -Recurse).Count -eq 0) `
+    'Checked-in fixture contains stale Maven target output.'
   $fixtureRoot = New-LiveFixture
   $fixtureTemp = Join-Path $script:TestRoot 'fixture temp with spaces'
   New-Item -ItemType Directory -Path $fixtureTemp -Force | Out-Null
-  $realMaven = (Get-Command mvn -CommandType Application).Source
+  $realMaven = Resolve-FirstApplicationPath 'mvn'
   $fixtureBin = New-FixtureTools -FixtureRoot $fixtureRoot `
     -RealMaven $realMaven
+  Assert-True (-not $realMaven.StartsWith(
+      $fixtureBin, [StringComparison]::Ordinal)) `
+    'Real Maven resolution selected the fixture wrapper recursively.'
   $environment = New-TestEnvironment
   $environment['PATH'] =
     "$fixtureBin$([IO.Path]::PathSeparator)$($environment['PATH'])"
@@ -996,6 +1061,21 @@ wait "$child"
         Value = '-DargLine=-javaagent:/tmp/fixture-agent.jar'
       },
       @{
+        Name = 'maven-config-complete-quoted-argline'
+        File = 'maven.config'
+        Value = '-D"argLine=harmless-value"'
+      },
+      @{
+        Name = 'maven-config-quoted-name-argline'
+        File = 'maven.config'
+        Value = '-D"argLine"=harmless-value'
+      },
+      @{
+        Name = 'maven-config-complete-quoted-repository'
+        File = 'maven.config'
+        Value = '--define="maven.repo.local=/tmp/fixture-repository"'
+      },
+      @{
         Name = 'jvm-config-agent'
         File = 'jvm.config'
         Value = '-javaagent:/tmp/fixture-agent.jar'
@@ -1003,25 +1083,44 @@ wait "$child"
     $configPath = Join-Path $mavenConfigDirectory $configCase.File
     Set-Content -LiteralPath $configPath -Value $configCase.Value `
       -Encoding utf8NoBOM
+    [IO.File]::WriteAllText(
+      $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+      [Text.UTF8Encoding]::new($false))
     $configOutput = Invoke-LiveScript -ScriptPath $fixturePreflight `
       -SourceDirectory $fixtureRoot -TempDirectory $fixtureTemp `
       -Environment $environment -ExpectedExitCode 1
     Assert-Contains $configOutput 'contains forbidden' `
       "Preflight accepted $($configCase.Name)."
+    Assert-True ([string]::IsNullOrWhiteSpace((
+          Get-Content -LiteralPath `
+            $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
+      "Preflight case '$($configCase.Name)' reached Maven."
     Remove-Item -LiteralPath $configPath -Force
   }
-  $forbiddenEnvironment =
-    [Collections.Generic.Dictionary[string, string]]::new(
-      $environment, [StringComparer]::Ordinal)
-  $forbiddenEnvironment['MAVEN_ARGS'] =
-    '--define maven.repo.local=/tmp/fixture-repository'
-  $environmentOutput = Invoke-LiveScript `
-    -ScriptPath $fixturePreflight -SourceDirectory $fixtureRoot `
-    -TempDirectory $fixtureTemp -Environment $forbiddenEnvironment `
-    -ExpectedExitCode 1
-  Assert-Contains $environmentOutput `
-    "Environment variable 'MAVEN_ARGS' contains forbidden" `
-    'Preflight accepted a Maven repository redirect from the environment.'
+  foreach ($environmentCase in @(
+      '--define maven.repo.local=/tmp/fixture-repository',
+      '--define="maven.repo.local=/tmp/fixture-repository"',
+      '-D"argLine=harmless-value"',
+      '-D"argLine"=harmless-value')) {
+    $forbiddenEnvironment =
+      [Collections.Generic.Dictionary[string, string]]::new(
+        $environment, [StringComparer]::Ordinal)
+    $forbiddenEnvironment['MAVEN_ARGS'] = $environmentCase
+    [IO.File]::WriteAllText(
+      $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+      [Text.UTF8Encoding]::new($false))
+    $environmentOutput = Invoke-LiveScript `
+      -ScriptPath $fixturePreflight -SourceDirectory $fixtureRoot `
+      -TempDirectory $fixtureTemp -Environment $forbiddenEnvironment `
+      -ExpectedExitCode 1
+    Assert-Contains $environmentOutput `
+      "Environment variable 'MAVEN_ARGS' contains forbidden" `
+      "Preflight accepted Maven environment injection '$environmentCase'."
+    Assert-True ([string]::IsNullOrWhiteSpace((
+          Get-Content -LiteralPath `
+            $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
+      "Preflight environment case '$environmentCase' reached Maven."
+  }
   [IO.File]::WriteAllText(
     $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
     [Text.UTF8Encoding]::new($false))
@@ -1055,7 +1154,10 @@ wait "$child"
     [Collections.Generic.Dictionary[string, string]]::new(
       $environment, [StringComparer]::Ordinal)
   $postAuthEnvironment['MAVEN_ARGS'] =
-    '-Dmaven.surefire.debug=-agentlib:jdwp=transport=dt_socket'
+    '-D"maven.surefire.debug=harmless-value"'
+  [IO.File]::WriteAllText(
+    $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+    [Text.UTF8Encoding]::new($false))
   $postAuthEnvironmentOutput = Invoke-LiveScript `
     -ScriptPath $fixtureRunner -SourceDirectory $fixtureRoot `
     -TempDirectory $fixtureTemp -Environment $postAuthEnvironment `
@@ -1063,20 +1165,131 @@ wait "$child"
   Assert-Contains $postAuthEnvironmentOutput `
     "Environment variable 'MAVEN_ARGS' contains forbidden" `
     'Authenticated runner did not recheck environment injection.'
+  Assert-True ([string]::IsNullOrWhiteSpace((
+        Get-Content -LiteralPath `
+          $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
+    'Authenticated runner environment rejection reached Maven.'
   $postAuthConfig = Join-Path $mavenConfigDirectory 'maven.config'
   Set-Content -LiteralPath $postAuthConfig `
-    -Value '--define maven.repo.local=/tmp/post-auth-repository' `
+    -Value '--define="maven.repo.local=/tmp/post-auth-repository"' `
     -Encoding utf8NoBOM
   try {
+    [IO.File]::WriteAllText(
+      $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+      [Text.UTF8Encoding]::new($false))
     $postAuthConfigOutput = Invoke-LiveScript `
       -ScriptPath $fixtureRunner -SourceDirectory $fixtureRoot `
       -TempDirectory $fixtureTemp -Environment $environment `
       -ExpectedExitCode 1
     Assert-Contains $postAuthConfigOutput 'contains forbidden' `
       'Authenticated runner did not recheck .mvn configuration.'
+    Assert-True ([string]::IsNullOrWhiteSpace((
+          Get-Content -LiteralPath `
+            $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
+      'Authenticated runner .mvn rejection reached Maven.'
   } finally {
     Remove-Item -LiteralPath $postAuthConfig -Force
   }
+
+  $argumentManifest = Join-Path $fixtureTemp `
+    'live-cosmos-maven-arguments.json'
+  $validatedArguments = [string[]](
+    Get-Content -LiteralPath $argumentManifest -Raw |
+      ConvertFrom-Json)
+  foreach ($manifestCase in @(
+      'extra-key',
+      'extra-argline',
+      'extra-debug',
+      'missing-entry',
+      'reordered-entries',
+      'duplicate-entry',
+      'non-string-entry',
+      'altered-profile',
+      'altered-test',
+      'altered-timeout',
+      'altered-output',
+      'altered-dependency-output')) {
+    $mutatedArguments = @($validatedArguments)
+    switch ($manifestCase) {
+      'extra-key' {
+        $mutatedArguments += '-Dcosmos.key=fixture'
+      }
+      'extra-argline' {
+        $mutatedArguments += '-DargLine=-javaagent:/tmp/fixture.jar'
+      }
+      'extra-debug' {
+        $mutatedArguments += '-Dmaven.surefire.debug=true'
+      }
+      'missing-entry' {
+        $mutatedArguments = @($mutatedArguments[0..10])
+      }
+      'reordered-entries' {
+        $mutatedArguments[0], $mutatedArguments[1] =
+          $mutatedArguments[1], $mutatedArguments[0]
+      }
+      'duplicate-entry' {
+        $mutatedArguments[1] = $mutatedArguments[0]
+      }
+      'non-string-entry' {
+        $mutatedArguments[5] = 42
+      }
+      'altered-profile' {
+        $mutatedArguments[0] = '-Punit'
+      }
+      'altered-test' {
+        $mutatedArguments[4] = '-Dtest=DifferentTest'
+      }
+      'altered-timeout' {
+        $mutatedArguments[7] =
+          '-Djunit.jupiter.execution.timeout.default=600s'
+      }
+      'altered-output' {
+        $mutatedArguments[9] = '-Doutput=/tmp/altered-effective.xml'
+      }
+      'altered-dependency-output' {
+        $mutatedArguments[11] =
+          '-Dmdep.outputFile=/tmp/altered-classpath.txt'
+      }
+    }
+    [IO.File]::WriteAllText(
+      $argumentManifest,
+      (ConvertTo-Json -InputObject (
+          [object[]]$mutatedArguments) -Compress),
+      [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(
+      $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+      [Text.UTF8Encoding]::new($false))
+    $tamperedOutput = Invoke-LiveScript `
+      -ScriptPath $fixtureRunner -SourceDirectory $fixtureRoot `
+      -TempDirectory $fixtureTemp -Environment $environment `
+      -ExpectedExitCode 1
+    if (-not $tamperedOutput.Contains(
+        'Maven argument manifest does not exactly match',
+        [StringComparison]::Ordinal)) {
+      throw @"
+Runner accepted manifest tampering case '$manifestCase'.
+$tamperedOutput
+"@
+    }
+    Assert-True ([string]::IsNullOrWhiteSpace((
+          Get-Content -LiteralPath `
+            $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
+      "Manifest tampering case '$manifestCase' reached Maven."
+  }
+  [IO.File]::WriteAllText(
+    $argumentManifest,
+    (ConvertTo-Json -InputObject (
+        [object[]]$validatedArguments) -Compress),
+    [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText(
+    $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+    [Text.UTF8Encoding]::new($false))
+  Write-Host (
+    'PASS exact manifest vector rejected twelve tampering cases before Maven.')
+  Invoke-LiveScript -ScriptPath $fixturePreflight `
+    -SourceDirectory $fixtureRoot -TempDirectory $fixtureTemp `
+    -Environment $environment | Out-Null
+
   $runnerOutput = Invoke-LiveScript -ScriptPath $fixtureRunner `
     -SourceDirectory $fixtureRoot -TempDirectory $fixtureTemp `
     -Environment $environment
@@ -1085,6 +1298,8 @@ wait "$child"
     'Positive authenticated runner did not validate provider metadata.'
   Assert-True (Test-Path -LiteralPath $fixtureReport -PathType Leaf) `
     'Positive runner did not produce the dedicated JUnit report.'
+  Write-Host (
+    'PASS clean fixture compiled local API doubles and produced the JUnit report.')
   [xml]$result = Get-Content -LiteralPath $fixtureReport -Raw
   $cases = @($result.SelectNodes(
     "//testcase[@classname='com.multiclouddb.conformance.LiveCosmosEntraAuthenticationTest']"))
@@ -1189,8 +1404,6 @@ wait "$child"
       [string]::Join([char]0, $sharedArguments)) `
     'Verify arguments differ from the validated manifest.'
 
-  $argumentManifest = Join-Path $fixtureTemp `
-    'live-cosmos-maven-arguments.json'
   $savedManifest = [IO.File]::ReadAllBytes($argumentManifest)
   Remove-Item -LiteralPath $argumentManifest -Force
   try {

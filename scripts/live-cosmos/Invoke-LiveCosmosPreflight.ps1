@@ -157,19 +157,8 @@ if ($errors.Count -eq 0) {
   # effective-POM inspection, classpath preparation, and the
   # later WIF test execution.
   $liveMavenArguments = @(
-    '-Plive-cosmos',
-    '-pl',
-    'multiclouddb-conformance',
-    '-am',
-    "-Dtest=LiveCosmosEntraAuthenticationTest#$sentinelMethod",
-    '-Dsurefire.failIfNoSpecifiedTests=false',
-    "-Dcosmos.endpoint=$endpoint",
-    '-Djunit.jupiter.execution.timeout.default=60s',
-    '-DtrimStackTrace=false',
-    "-Doutput=$effectivePom",
-    '-DincludeScope=test',
-    "-Dmdep.outputFile=$providerDependencyClasspathFile"
-  )
+    Get-LiveCosmosMavenArguments `
+      -Endpoint $endpoint -TempDirectory $TempDirectory)
   $profileMetadata =
     [System.Collections.Generic.List[string]]::new()
   & mvn help:active-profiles `
