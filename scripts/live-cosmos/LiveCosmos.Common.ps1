@@ -15,7 +15,7 @@ function Write-FilteredMavenOutput {
 }
 
 $forbiddenJvmPropertyName =
-  '(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)'
+  '(?:cosmos\.(?:key|endpoint)|COSMOS_(?:KEY|ENDPOINT)|jdk\.(?:tls|certpath)\.disabledAlgorithms|java\.security\.properties|user\.home|surefire\.systemPropertiesFile|azure\.client\.(?:secret|certificate\.(?:path|password))|AZURE_CLIENT_SECRET|AZURE_CLIENT_CERTIFICATE_(?:PATH|PASSWORD)|AZURE_TOKEN_CREDENTIALS)'
 $forbiddenJvmPropertyToken =
   "(?:[""']?$forbiddenJvmPropertyName|`"$forbiddenJvmPropertyName`"|'$forbiddenJvmPropertyName')"
 $forbiddenJvmPropertyPattern =
@@ -28,8 +28,10 @@ $forbiddenMavenProjectPropertyName =
   'maven\.(?:multiModuleProjectDirectory|projectBasedir|ext\.class\.path)'
 $forbiddenMavenProjectPropertyToken =
   "(?:[""']?$forbiddenMavenProjectPropertyName|`"$forbiddenMavenProjectPropertyName`"|'$forbiddenMavenProjectPropertyName')"
+$forbiddenMavenProjectPropertyPattern =
+  "(?i)(?:^|\s)[""']?(?:-D\s*|--define(?:=|\s+))$forbiddenMavenProjectPropertyToken(?:\s*=|\s|$)"
 $forbiddenNestedJvmConfigPattern =
-  "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|(?:^|\s)[""']?-D$forbiddenMavenProjectPropertyToken(?:\s*=|\s|$)"
+  "$forbiddenJvmPropertyPattern|$forbiddenJvmArgumentIndirectionPattern|$forbiddenJvmExecutableOptionPattern|(?:^|\s)[""']?(?-i:--(?:file|settings|global-settings|toolchains|global-toolchains)(?:\s+|=)\S|-(?:s|t)(?:\s+|=)?\S|-(?:gs|gt)(?:\s+|=)\S|-f(?!(?:ae|f|n|npr|npu|nsu)(?:\s|$))(?:\s+|=|\S))|$forbiddenMavenProjectPropertyPattern"
 $forbiddenMavenRepositoryPropertyName =
   'maven\.repo\.local'
 $forbiddenMavenRepositoryPropertyToken =

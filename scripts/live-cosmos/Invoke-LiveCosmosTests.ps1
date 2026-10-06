@@ -202,15 +202,42 @@ foreach ($providerClassName in `
   $approvedProviderOrigins[$providerClassName] = (
     Resolve-Path -LiteralPath $providerClasses).Path
 }
+$approvedApiClasses = @(
+  'com.multiclouddb.api.DocumentResult',
+  'com.multiclouddb.api.MulticloudDbClient',
+  'com.multiclouddb.api.MulticloudDbClientConfig',
+  'com.multiclouddb.api.MulticloudDbClientFactory',
+  'com.multiclouddb.api.MulticloudDbKey',
+  'com.multiclouddb.api.ProviderId',
+  'com.multiclouddb.api.ResourceAddress'
+)
+$approvedApiClassesPath = Join-Path $trustedProjectBase `
+  'multiclouddb-api/target/classes'
+if (-not (Test-Path -LiteralPath `
+    $approvedApiClassesPath -PathType Container)) {
+  throw "Approved API output is missing: $approvedApiClassesPath"
+}
+$approvedApiOrigin = (
+  Resolve-Path -LiteralPath $approvedApiClassesPath).Path
+$approvedClassOrigins = [ordered]@{}
+foreach ($apiClassName in $approvedApiClasses) {
+  $approvedClassOrigins[$apiClassName] =
+    $approvedApiOrigin
+}
+foreach ($providerClassName in `
+    $approvedProviderOrigins.Keys) {
+  $approvedClassOrigins[$providerClassName] =
+    $approvedProviderOrigins[$providerClassName]
+}
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $providerValidationErrors =
   [Collections.Generic.List[string]]::new()
 $providerRegistrationOrigins = @{}
-$firstProviderClassOrigins = @{}
+$firstApprovedClassOrigins = @{}
 foreach ($classpathEntry in $providerClasspathEntries) {
   $descriptorTexts = @()
-  $providerClassEntries = @{}
+  $approvedClassEntries = @{}
   if (Test-Path -LiteralPath `
       $classpathEntry -PathType Container) {
     $descriptorPath = Join-Path `
@@ -227,15 +254,15 @@ foreach ($classpathEntry in $providerClasspathEntries) {
           "Provider descriptor is not valid UTF-8: $descriptorPath")
       }
     }
-    foreach ($providerClassName in `
-        $approvedProviderOrigins.Keys) {
-      $providerClassPath = Join-Path $classpathEntry `
-        ($providerClassName.Replace(
+    foreach ($approvedClassName in `
+        $approvedClassOrigins.Keys) {
+      $approvedClassPath = Join-Path $classpathEntry `
+        ($approvedClassName.Replace(
           '.', [IO.Path]::DirectorySeparatorChar) +
           '.class')
       if (Test-Path -LiteralPath `
-          $providerClassPath -PathType Leaf) {
-        $providerClassEntries[$providerClassName] = 1
+          $approvedClassPath -PathType Leaf) {
+        $approvedClassEntries[$approvedClassName] = 1
       }
     }
   } else {
@@ -355,10 +382,10 @@ foreach ($classpathEntry in $providerClasspathEntries) {
           $descriptorStream.Dispose()
         }
       }
-      foreach ($providerClassName in `
-          $approvedProviderOrigins.Keys) {
+      foreach ($approvedClassName in `
+          $approvedClassOrigins.Keys) {
         $classResource =
-          $providerClassName.Replace('.', '/') +
+          $approvedClassName.Replace('.', '/') +
           '.class'
         $baseClassEntries = @($archive.Entries |
           Where-Object {
@@ -366,7 +393,7 @@ foreach ($classpathEntry in $providerClasspathEntries) {
           })
         if ($baseClassEntries.Count -gt 1) {
           $providerValidationErrors.Add(
-            "Classpath archive has duplicate provider class entries for $providerClassName`: $classpathEntry")
+            "Classpath archive has duplicate approved class entries for $approvedClassName`: $classpathEntry")
         }
         $versionedClassEntries = @()
         if ($isMultiReleaseArchive) {
@@ -391,12 +418,12 @@ foreach ($classpathEntry in $providerClasspathEntries) {
           )
           if ($versionedClassEntries.Count -ne 0) {
             $providerValidationErrors.Add(
-              "Multi-release archive defines approved provider class '$providerClassName' for Java 17: $classpathEntry")
+              "Multi-release archive defines approved class '$approvedClassName' for Java 17: $classpathEntry")
           }
         }
         if ($baseClassEntries.Count -ne 0 `
             -or $versionedClassEntries.Count -ne 0) {
-          $providerClassEntries[$providerClassName] =
+          $approvedClassEntries[$approvedClassName] =
             $baseClassEntries.Count +
             $versionedClassEntries.Count
         }
@@ -411,11 +438,11 @@ foreach ($classpathEntry in $providerClasspathEntries) {
     }
   }
 
-  foreach ($providerClassName in `
-      $providerClassEntries.Keys) {
-    if (-not $firstProviderClassOrigins.ContainsKey(
-        $providerClassName)) {
-      $firstProviderClassOrigins[$providerClassName] =
+  foreach ($approvedClassName in `
+      $approvedClassEntries.Keys) {
+    if (-not $firstApprovedClassOrigins.ContainsKey(
+        $approvedClassName)) {
+      $firstApprovedClassOrigins[$approvedClassName] =
         $classpathEntry
     }
   }
@@ -464,28 +491,33 @@ foreach ($providerClassName in `
     $providerValidationErrors.Add(
       "Provider registration '$providerClassName' must originate from: $approvedOrigin")
   }
-  if (-not $firstProviderClassOrigins.ContainsKey(
-      $providerClassName)) {
+}
+foreach ($approvedClassName in `
+    $approvedClassOrigins.Keys) {
+  $approvedOrigin =
+    $approvedClassOrigins[$approvedClassName]
+  if (-not $firstApprovedClassOrigins.ContainsKey(
+      $approvedClassName)) {
     $providerValidationErrors.Add(
-      "Missing approved provider class '$providerClassName'.")
-  } elseif ($firstProviderClassOrigins[
-      $providerClassName] -cne $approvedOrigin) {
+      "Missing approved class '$approvedClassName'.")
+  } elseif ($firstApprovedClassOrigins[
+      $approvedClassName] -cne $approvedOrigin) {
     $providerValidationErrors.Add(
-      "The first classpath definition of '$providerClassName' must originate from: $approvedOrigin")
+      "The first classpath definition of '$approvedClassName' must originate from: $approvedOrigin")
   }
 }
 if ($providerValidationErrors.Count -ne 0) {
   throw @"
-The live test classpath provider metadata is invalid:
+The live test classpath API or provider metadata is invalid:
 $($providerValidationErrors -join [Environment]::NewLine)
-Only the production Cosmos, Dynamo, and Spanner provider registrations and
-classes from their canonical reactor target/classes outputs are permitted.
-Test, generated, shadowed, malformed, duplicate, or dependency provider
-registrations are unsupported.
+Only the API classes used by the live sentinel and the production Cosmos,
+Dynamo, and Spanner provider registrations and classes from their canonical
+reactor target/classes outputs are permitted. Test, generated, shadowed,
+malformed, duplicate, or dependency definitions are unsupported.
 "@
 }
 Write-Host (
-  'Validated production provider descriptors and class origins without loading provider classes.')
+  'Validated production API and provider class origins without loading classes.')
 
 # This exact future sentinel must perform a real Cosmos data-plane
 # operation using DefaultAzureCredential and fail (never skip) if

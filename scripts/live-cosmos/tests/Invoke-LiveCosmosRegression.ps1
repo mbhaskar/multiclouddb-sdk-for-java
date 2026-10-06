@@ -303,7 +303,6 @@ function New-LiveFixture {
     -Destination $fixtureRoot -Recurse
 
   foreach ($module in @(
-      'multiclouddb-api',
       'multiclouddb-provider-cosmos',
       'multiclouddb-provider-dynamo',
       'multiclouddb-provider-spanner')) {
@@ -389,6 +388,12 @@ case "$goal" in
     if [ -n "${LIVE_COSMOS_TEST_DESCRIPTOR_FIXTURE:-}" ]; then
       mkdir -p "$(dirname "$descriptor")"
       cp "$LIVE_COSMOS_TEST_DESCRIPTOR_FIXTURE" "$descriptor"
+    fi
+    api_shadow="$PWD/multiclouddb-conformance/target/test-classes/com/multiclouddb/api/MulticloudDbClientFactory.class"
+    rm -f "$api_shadow"
+    if [ "${LIVE_COSMOS_TEST_API_SHADOW:-}" = "true" ]; then
+      mkdir -p "$(dirname "$api_shadow")"
+      cp "$PWD/multiclouddb-api/target/classes/com/multiclouddb/api/MulticloudDbClientFactory.class" "$api_shadow"
     fi
     if [ "${LIVE_COSMOS_SKIP_CLASSPATH_FILE:-}" = "true" ]; then
       rm -f "$dependency_output"
@@ -842,6 +847,15 @@ wait "$child"
   Assert-True (Test-ForbiddenMavenConfiguration `
       '--define maven.repo.local=/tmp/repository') `
     'Shared helper accepted a Maven repository redirect.'
+  Assert-True (Test-ForbiddenMavenConfiguration `
+      '--define maven.projectBasedir=/tmp/project') `
+    'Shared helper accepted a Maven project-base redirect.'
+  Assert-True (Test-ForbiddenMavenConfiguration `
+      '--define="maven.ext.class.path=/tmp/extension.jar"') `
+    'Shared helper accepted a Maven extension classpath.'
+  Assert-True (Test-ForbiddenMavenConfiguration `
+      '-Duser.home=/tmp/alternate-home') `
+    'Shared helper accepted a JVM user-home redirect.'
   Assert-True (-not (Test-ForbiddenMavenConfiguration `
       '-B -T1 -Xmx512m -DtrustStore=/tmp/trusted.jks')) `
     'Shared helper rejected benign process options.'
@@ -858,7 +872,11 @@ wait "$child"
       '-D"maven.repo.local"=/tmp/fixture-repository',
       '--define="maven.repo.local=/tmp/fixture-repository"',
       '-D"maven.projectBasedir=/tmp/fixture-project"',
-      '-D"maven.projectBasedir"=/tmp/fixture-project')) {
+      '-D"maven.projectBasedir"=/tmp/fixture-project',
+      '--define="maven.projectBasedir=/tmp/fixture-project"',
+      '--define "maven.ext.class.path"=/tmp/fixture-extension.jar',
+      '-D"user.home=/tmp/fixture-home"',
+      '-D"user.home"=/tmp/fixture-home')) {
     Assert-True (Test-ForbiddenMavenConfiguration $quotedForbidden) `
       "Shared helper accepted quoted forbidden property: $quotedForbidden"
   }
@@ -1076,9 +1094,24 @@ wait "$child"
         Value = '--define="maven.repo.local=/tmp/fixture-repository"'
       },
       @{
+        Name = 'maven-config-project-basedir-define'
+        File = 'maven.config'
+        Value = "--define`nmaven.projectBasedir=/tmp/fixture-project"
+      },
+      @{
+        Name = 'maven-config-extension-classpath-define'
+        File = 'maven.config'
+        Value = '--define="maven.ext.class.path=/tmp/fixture-extension.jar"'
+      },
+      @{
         Name = 'jvm-config-agent'
         File = 'jvm.config'
         Value = '-javaagent:/tmp/fixture-agent.jar'
+      },
+      @{
+        Name = 'jvm-config-user-home'
+        File = 'jvm.config'
+        Value = '-Duser.home=/tmp/fixture-home'
       })) {
     $configPath = Join-Path $mavenConfigDirectory $configCase.File
     Set-Content -LiteralPath $configPath -Value $configCase.Value `
@@ -1098,14 +1131,43 @@ wait "$child"
     Remove-Item -LiteralPath $configPath -Force
   }
   foreach ($environmentCase in @(
-      '--define maven.repo.local=/tmp/fixture-repository',
-      '--define="maven.repo.local=/tmp/fixture-repository"',
-      '-D"argLine=harmless-value"',
-      '-D"argLine"=harmless-value')) {
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '--define maven.repo.local=/tmp/fixture-repository'
+      },
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '--define="maven.repo.local=/tmp/fixture-repository"'
+      },
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '-D"argLine=harmless-value"'
+      },
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '-D"argLine"=harmless-value'
+      },
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '--define maven.projectBasedir=/tmp/fixture-project'
+      },
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '--define="maven.ext.class.path=/tmp/fixture-extension.jar"'
+      },
+      @{
+        Variable = 'MAVEN_OPTS'
+        Value = '-Duser.home=/tmp/fixture-home'
+      },
+      @{
+        Variable = 'JAVA_TOOL_OPTIONS'
+        Value = '-Duser.home=/tmp/fixture-home'
+      })) {
     $forbiddenEnvironment =
       [Collections.Generic.Dictionary[string, string]]::new(
         $environment, [StringComparer]::Ordinal)
-    $forbiddenEnvironment['MAVEN_ARGS'] = $environmentCase
+    $forbiddenEnvironment[$environmentCase.Variable] =
+      $environmentCase.Value
     [IO.File]::WriteAllText(
       $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
       [Text.UTF8Encoding]::new($false))
@@ -1114,12 +1176,12 @@ wait "$child"
       -TempDirectory $fixtureTemp -Environment $forbiddenEnvironment `
       -ExpectedExitCode 1
     Assert-Contains $environmentOutput `
-      "Environment variable 'MAVEN_ARGS' contains forbidden" `
-      "Preflight accepted Maven environment injection '$environmentCase'."
+      "Environment variable '$($environmentCase.Variable)' contains forbidden" `
+      "Preflight accepted Maven environment injection '$($environmentCase.Value)'."
     Assert-True ([string]::IsNullOrWhiteSpace((
           Get-Content -LiteralPath `
             $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
-      "Preflight environment case '$environmentCase' reached Maven."
+      "Preflight environment case '$($environmentCase.Value)' reached Maven."
   }
   [IO.File]::WriteAllText(
     $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
@@ -1150,45 +1212,73 @@ wait "$child"
           Join-Path $fixtureTemp 'live-cosmos-effective-pom.xml') -Raw
       ).Contains('STALE_FIXTURE_VALUE'))) `
     'Positive preflight retained stale effective-POM content.'
-  $postAuthEnvironment =
-    [Collections.Generic.Dictionary[string, string]]::new(
-      $environment, [StringComparer]::Ordinal)
-  $postAuthEnvironment['MAVEN_ARGS'] =
-    '-D"maven.surefire.debug=harmless-value"'
-  [IO.File]::WriteAllText(
-    $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
-    [Text.UTF8Encoding]::new($false))
-  $postAuthEnvironmentOutput = Invoke-LiveScript `
-    -ScriptPath $fixtureRunner -SourceDirectory $fixtureRoot `
-    -TempDirectory $fixtureTemp -Environment $postAuthEnvironment `
-    -ExpectedExitCode 1
-  Assert-Contains $postAuthEnvironmentOutput `
-    "Environment variable 'MAVEN_ARGS' contains forbidden" `
-    'Authenticated runner did not recheck environment injection.'
-  Assert-True ([string]::IsNullOrWhiteSpace((
-        Get-Content -LiteralPath `
-          $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
-    'Authenticated runner environment rejection reached Maven.'
-  $postAuthConfig = Join-Path $mavenConfigDirectory 'maven.config'
-  Set-Content -LiteralPath $postAuthConfig `
-    -Value '--define="maven.repo.local=/tmp/post-auth-repository"' `
-    -Encoding utf8NoBOM
-  try {
+  foreach ($postAuthEnvironmentCase in @(
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '-D"maven.surefire.debug=harmless-value"'
+      },
+      @{
+        Variable = 'MAVEN_ARGS'
+        Value = '--define maven.projectBasedir=/tmp/post-auth-project'
+      },
+      @{
+        Variable = 'MAVEN_OPTS'
+        Value = '-Duser.home=/tmp/post-auth-home'
+      })) {
+    $postAuthEnvironment =
+      [Collections.Generic.Dictionary[string, string]]::new(
+        $environment, [StringComparer]::Ordinal)
+    $postAuthEnvironment[$postAuthEnvironmentCase.Variable] =
+      $postAuthEnvironmentCase.Value
     [IO.File]::WriteAllText(
       $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
       [Text.UTF8Encoding]::new($false))
-    $postAuthConfigOutput = Invoke-LiveScript `
+    $postAuthEnvironmentOutput = Invoke-LiveScript `
       -ScriptPath $fixtureRunner -SourceDirectory $fixtureRoot `
-      -TempDirectory $fixtureTemp -Environment $environment `
+      -TempDirectory $fixtureTemp -Environment $postAuthEnvironment `
       -ExpectedExitCode 1
-    Assert-Contains $postAuthConfigOutput 'contains forbidden' `
-      'Authenticated runner did not recheck .mvn configuration.'
+    Assert-Contains $postAuthEnvironmentOutput `
+      "Environment variable '$($postAuthEnvironmentCase.Variable)' contains forbidden" `
+      'Authenticated runner did not recheck environment injection.'
     Assert-True ([string]::IsNullOrWhiteSpace((
           Get-Content -LiteralPath `
             $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
-      'Authenticated runner .mvn rejection reached Maven.'
-  } finally {
-    Remove-Item -LiteralPath $postAuthConfig -Force
+      'Authenticated runner environment rejection reached Maven.'
+  }
+  foreach ($postAuthConfigCase in @(
+      @{
+        File = 'maven.config'
+        Value = '--define="maven.repo.local=/tmp/post-auth-repository"'
+      },
+      @{
+        File = 'maven.config'
+        Value = '--define maven.ext.class.path=/tmp/post-auth-extension.jar'
+      },
+      @{
+        File = 'jvm.config'
+        Value = '-Duser.home=/tmp/post-auth-home'
+      })) {
+    $postAuthConfig = Join-Path $mavenConfigDirectory `
+      $postAuthConfigCase.File
+    Set-Content -LiteralPath $postAuthConfig `
+      -Value $postAuthConfigCase.Value -Encoding utf8NoBOM
+    try {
+      [IO.File]::WriteAllText(
+        $environment['LIVE_COSMOS_MAVEN_CALL_LOG'], '',
+        [Text.UTF8Encoding]::new($false))
+      $postAuthConfigOutput = Invoke-LiveScript `
+        -ScriptPath $fixtureRunner -SourceDirectory $fixtureRoot `
+        -TempDirectory $fixtureTemp -Environment $environment `
+        -ExpectedExitCode 1
+      Assert-Contains $postAuthConfigOutput 'contains forbidden' `
+        'Authenticated runner did not recheck .mvn configuration.'
+      Assert-True ([string]::IsNullOrWhiteSpace((
+            Get-Content -LiteralPath `
+              $environment['LIVE_COSMOS_MAVEN_CALL_LOG'] -Raw))) `
+        'Authenticated runner .mvn rejection reached Maven.'
+    } finally {
+      Remove-Item -LiteralPath $postAuthConfig -Force
+    }
   }
 
   $argumentManifest = Join-Path $fixtureTemp `
@@ -1294,8 +1384,8 @@ $tamperedOutput
     -SourceDirectory $fixtureRoot -TempDirectory $fixtureTemp `
     -Environment $environment
   Assert-Contains $runnerOutput `
-    'Validated production provider descriptors and class origins' `
-    'Positive authenticated runner did not validate provider metadata.'
+    'Validated production API and provider class origins' `
+    'Positive authenticated runner did not validate API and provider metadata.'
   Assert-True (Test-Path -LiteralPath $fixtureReport -PathType Leaf) `
     'Positive runner did not produce the dedicated JUnit report.'
   Write-Host (
@@ -1439,6 +1529,14 @@ $tamperedOutput
     -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
     -RunnerScript $fixtureRunner -BaseEnvironment $environment `
     -ClasspathPrepend $earlierShadow
+
+  Invoke-ProviderMetadataFailureCase -Name 'api-test-output-shadow' `
+    -Expected 'MulticloudDbClientFactory' `
+    -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
+    -RunnerScript $fixtureRunner -BaseEnvironment $environment `
+    -AdditionalEnvironment @{
+      LIVE_COSMOS_TEST_API_SHADOW = 'true'
+    }
 
   $multiReleaseArchive = Join-Path $providerFixtures `
     'multi-release-shadow.jar'
