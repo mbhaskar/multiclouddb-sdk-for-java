@@ -6,7 +6,7 @@ These scripts back `azure-pipelines-live-cosmos.yml`.
   the validated Maven argument manifest into the supplied temporary directory.
 - `Invoke-LiveCosmosTests.ps1` runs inside the same `AzureCLI@2` task that
   establishes the Workload Identity Federation session. It compiles and
-  validates the sentinel API and provider class origins, then executes the
+  validates SDK-owned API, SPI, and provider class origins, then executes the
   live sentinel.
 - `Remove-LiveCosmosTestResults.ps1` removes stale sentinel reports before the
   build and fails if cleanup does not complete.
@@ -31,6 +31,6 @@ pwsh -File scripts/live-cosmos/tests/Invoke-LiveCosmosRegression.ps1
 
 The fixture pins `maven-compiler-plugin` 3.12.1, matching this repository. Its
 separate fixture API module models the canonical reactor API output so the
-origin checks are exercised without test-output shadows. The harness uses fake
-Azure CLI authentication and an in-memory test client. It does not contact
-Azure or Cosmos DB.
+origin checks are exercised without test-output API or SPI shadows. The
+harness uses fake Azure CLI authentication and an in-memory test client. It
+does not contact Azure or Cosmos DB.

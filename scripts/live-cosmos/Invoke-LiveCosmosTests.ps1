@@ -202,35 +202,182 @@ foreach ($providerClassName in `
   $approvedProviderOrigins[$providerClassName] = (
     Resolve-Path -LiteralPath $providerClasses).Path
 }
-$approvedApiClasses = @(
-  'com.multiclouddb.api.DocumentResult',
-  'com.multiclouddb.api.MulticloudDbClient',
-  'com.multiclouddb.api.MulticloudDbClientConfig',
-  'com.multiclouddb.api.MulticloudDbClientFactory',
-  'com.multiclouddb.api.MulticloudDbKey',
-  'com.multiclouddb.api.ProviderId',
-  'com.multiclouddb.api.ResourceAddress'
+$approvedClassModules = [ordered]@{
+  'multiclouddb-api' = @(
+    'com/multiclouddb/api',
+    'com/multiclouddb/spi'
+  )
+  'multiclouddb-provider-cosmos' = @(
+    'com/multiclouddb/provider/cosmos'
+  )
+  'multiclouddb-provider-dynamo' = @(
+    'com/multiclouddb/provider/dynamo'
+  )
+  'multiclouddb-provider-spanner' = @(
+    'com/multiclouddb/provider/spanner'
+  )
+}
+$approvedClassResourcePrefixes = @(
+  'com/multiclouddb/api/',
+  'com/multiclouddb/spi/',
+  'com/multiclouddb/provider/cosmos/',
+  'com/multiclouddb/provider/dynamo/',
+  'com/multiclouddb/provider/spanner/'
 )
-$approvedApiClassesPath = Join-Path $trustedProjectBase `
-  'multiclouddb-api/target/classes'
-if (-not (Test-Path -LiteralPath `
-    $approvedApiClassesPath -PathType Container)) {
-  throw "Approved API output is missing: $approvedApiClassesPath"
-}
-$approvedApiOrigin = (
-  Resolve-Path -LiteralPath $approvedApiClassesPath).Path
 $approvedClassOrigins = [ordered]@{}
-foreach ($apiClassName in $approvedApiClasses) {
-  $approvedClassOrigins[$apiClassName] =
-    $approvedApiOrigin
+foreach ($moduleName in $approvedClassModules.Keys) {
+  $moduleClasses = Join-Path $trustedProjectBase `
+    "$moduleName/target/classes"
+  if (-not (Test-Path -LiteralPath `
+      $moduleClasses -PathType Container)) {
+    throw "Approved SDK output is missing: $moduleClasses"
+  }
+  $approvedOrigin = (
+    Resolve-Path -LiteralPath $moduleClasses).Path
+  foreach ($namespacePath in `
+      $approvedClassModules[$moduleName]) {
+    $namespaceClasses = Join-Path `
+      $approvedOrigin $namespacePath
+    if (-not (Test-Path -LiteralPath `
+        $namespaceClasses -PathType Container)) {
+      throw "Approved SDK namespace output is missing: $namespaceClasses"
+    }
+    foreach ($classFile in Get-ChildItem `
+        -LiteralPath $namespaceClasses `
+        -Recurse -File -Filter '*.class') {
+      $relativeClassPath =
+        [IO.Path]::GetRelativePath(
+          $approvedOrigin, $classFile.FullName)
+      $className = (
+        $relativeClassPath.Substring(
+          0, $relativeClassPath.Length -
+            '.class'.Length) `
+          -replace '[\\/]', '.')
+      if ($approvedClassOrigins.Contains(
+          $className)) {
+        throw "Approved SDK class '$className' is defined by multiple canonical module outputs."
+      }
+      $approvedClassOrigins[$className] =
+        $approvedOrigin
+    }
+  }
 }
-foreach ($providerClassName in `
-    $approvedProviderOrigins.Keys) {
-  $approvedClassOrigins[$providerClassName] =
-    $approvedProviderOrigins[$providerClassName]
+if ($approvedClassOrigins.Count -eq 0) {
+  throw 'The canonical SDK class-origin allowlist is empty.'
 }
+$requiredClassModules = [ordered]@{
+  'com.multiclouddb.api.DocumentResult' =
+    'multiclouddb-api'
+  'com.multiclouddb.api.MulticloudDbClient' =
+    'multiclouddb-api'
+  'com.multiclouddb.api.MulticloudDbClientConfig' =
+    'multiclouddb-api'
+  'com.multiclouddb.api.MulticloudDbClientFactory' =
+    'multiclouddb-api'
+  'com.multiclouddb.api.MulticloudDbKey' =
+    'multiclouddb-api'
+  'com.multiclouddb.api.ProviderId' =
+    'multiclouddb-api'
+  'com.multiclouddb.api.ResourceAddress' =
+    'multiclouddb-api'
+  'com.multiclouddb.provider.cosmos.CosmosProviderAdapter' =
+    'multiclouddb-provider-cosmos'
+  'com.multiclouddb.provider.dynamo.DynamoProviderAdapter' =
+    'multiclouddb-provider-dynamo'
+  'com.multiclouddb.provider.spanner.SpannerProviderAdapter' =
+    'multiclouddb-provider-spanner'
+}
+foreach ($requiredClassName in `
+    $requiredClassModules.Keys) {
+  $requiredOrigin = (
+    Resolve-Path -LiteralPath (
+      Join-Path $trustedProjectBase `
+        "$($requiredClassModules[$requiredClassName])/target/classes")).Path
+  if (-not $approvedClassOrigins.Contains(
+      $requiredClassName) `
+      -or $approvedClassOrigins[
+        $requiredClassName] -cne $requiredOrigin) {
+    throw "Required canonical SDK class is missing: $requiredClassName"
+  }
+}
+$approvedClassResources = [string[]]@(
+  foreach ($approvedClassName in `
+      $approvedClassOrigins.Keys) {
+    $approvedClassName.Replace('.', '/') +
+      '.class'
+  }
+)
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+if (-not ('LiveCosmosArchiveClassScanner' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO.Compression;
+
+public static class LiveCosmosArchiveClassScanner
+{
+    public static string[] Scan(
+        ZipArchive archive,
+        string[] approvedResources,
+        bool multiRelease)
+    {
+        var approved = new HashSet<string>(
+            approvedResources, StringComparer.Ordinal);
+        var baseCounts = new Dictionary<string, int>(
+            StringComparer.Ordinal);
+        var versionedCounts = new Dictionary<string, int>(
+            StringComparer.Ordinal);
+        const string versionPrefix = "META-INF/versions/";
+
+        foreach (var entry in archive.Entries)
+        {
+            var resource = entry.FullName;
+            var counts = baseCounts;
+            if (multiRelease &&
+                resource.StartsWith(
+                    versionPrefix, StringComparison.Ordinal))
+            {
+                var versionEnd = resource.IndexOf(
+                    '/', versionPrefix.Length);
+                if (versionEnd < 0 ||
+                    !int.TryParse(
+                        resource.Substring(
+                            versionPrefix.Length,
+                            versionEnd - versionPrefix.Length),
+                        out var version) ||
+                    version < 9 || version > 17)
+                {
+                    continue;
+                }
+                resource = resource.Substring(versionEnd + 1);
+                counts = versionedCounts;
+            }
+            if (!approved.Contains(resource))
+            {
+                continue;
+            }
+            counts.TryGetValue(resource, out var count);
+            counts[resource] = count + 1;
+        }
+
+        var findings = new List<string>(
+            baseCounts.Count + versionedCounts.Count);
+        foreach (var entry in baseCounts)
+        {
+            findings.Add(
+                "B\t" + entry.Key + "\t" + entry.Value);
+        }
+        foreach (var entry in versionedCounts)
+        {
+            findings.Add(
+                "V\t" + entry.Key + "\t" + entry.Value);
+        }
+        return findings.ToArray();
+    }
+}
+'@
+}
 $providerValidationErrors =
   [Collections.Generic.List[string]]::new()
 $providerRegistrationOrigins = @{}
@@ -254,15 +401,30 @@ foreach ($classpathEntry in $providerClasspathEntries) {
           "Provider descriptor is not valid UTF-8: $descriptorPath")
       }
     }
-    foreach ($approvedClassName in `
-        $approvedClassOrigins.Keys) {
-      $approvedClassPath = Join-Path $classpathEntry `
-        ($approvedClassName.Replace(
-          '.', [IO.Path]::DirectorySeparatorChar) +
-          '.class')
-      if (Test-Path -LiteralPath `
-          $approvedClassPath -PathType Leaf) {
-        $approvedClassEntries[$approvedClassName] = 1
+    foreach ($resourcePrefix in `
+        $approvedClassResourcePrefixes) {
+      $namespaceClasses = Join-Path $classpathEntry `
+        ($resourcePrefix.Replace(
+          '/', [IO.Path]::DirectorySeparatorChar))
+      if (-not (Test-Path -LiteralPath `
+          $namespaceClasses -PathType Container)) {
+        continue
+      }
+      foreach ($classFile in Get-ChildItem `
+          -LiteralPath $namespaceClasses `
+          -Recurse -File -Filter '*.class') {
+        $relativeClassPath =
+          [IO.Path]::GetRelativePath(
+            $classpathEntry, $classFile.FullName)
+        $className = (
+          $relativeClassPath.Substring(
+            0, $relativeClassPath.Length -
+              '.class'.Length) `
+            -replace '[\\/]', '.')
+        if ($approvedClassOrigins.Contains(
+            $className)) {
+          $approvedClassEntries[$className] = 1
+        }
       }
     }
   } else {
@@ -382,51 +544,28 @@ foreach ($classpathEntry in $providerClasspathEntries) {
           $descriptorStream.Dispose()
         }
       }
-      foreach ($approvedClassName in `
-          $approvedClassOrigins.Keys) {
-        $classResource =
-          $approvedClassName.Replace('.', '/') +
-          '.class'
-        $baseClassEntries = @($archive.Entries |
-          Where-Object {
-            $_.FullName -ceq $classResource
-          })
-        if ($baseClassEntries.Count -gt 1) {
+      foreach ($classFinding in `
+          [LiveCosmosArchiveClassScanner]::Scan(
+            $archive,
+            $approvedClassResources,
+            $isMultiReleaseArchive)) {
+        $findingParts = $classFinding.Split(
+          [char]9)
+        $approvedClassName = (
+          $findingParts[1].Substring(
+            0, $findingParts[1].Length -
+              '.class'.Length) -replace '/', '.')
+        $entryCount = [int]$findingParts[2]
+        if ($findingParts[0] -ceq 'V') {
+          $providerValidationErrors.Add(
+            "Multi-release archive defines approved class '$approvedClassName' for Java 17: $classpathEntry")
+        } elseif ($entryCount -gt 1) {
           $providerValidationErrors.Add(
             "Classpath archive has duplicate approved class entries for $approvedClassName`: $classpathEntry")
         }
-        $versionedClassEntries = @()
-        if ($isMultiReleaseArchive) {
-          $versionedClassPattern =
-            '^META-INF/versions/(?<version>[0-9]+)/' +
-            [regex]::Escape($classResource) + '$'
-          $versionedClassEntries = @(
-            foreach ($archiveEntry in `
-                $archive.Entries) {
-              $versionedClassMatch =
-                [regex]::Match(
-                  $archiveEntry.FullName,
-                  $versionedClassPattern)
-              if ($versionedClassMatch.Success) {
-                $version = [int]$versionedClassMatch.Groups['version'].Value
-                if ($version -ge 9 -and
-                    $version -le 17) {
-                  $archiveEntry
-                }
-              }
-            }
-          )
-          if ($versionedClassEntries.Count -ne 0) {
-            $providerValidationErrors.Add(
-              "Multi-release archive defines approved class '$approvedClassName' for Java 17: $classpathEntry")
-          }
-        }
-        if ($baseClassEntries.Count -ne 0 `
-            -or $versionedClassEntries.Count -ne 0) {
-          $approvedClassEntries[$approvedClassName] =
-            $baseClassEntries.Count +
-            $versionedClassEntries.Count
-        }
+        $approvedClassEntries[$approvedClassName] =
+          [int]$approvedClassEntries[
+            $approvedClassName] + $entryCount
       }
     } catch {
       $providerValidationErrors.Add(
@@ -510,10 +649,10 @@ if ($providerValidationErrors.Count -ne 0) {
   throw @"
 The live test classpath API or provider metadata is invalid:
 $($providerValidationErrors -join [Environment]::NewLine)
-Only the API classes used by the live sentinel and the production Cosmos,
-Dynamo, and Spanner provider registrations and classes from their canonical
-reactor target/classes outputs are permitted. Test, generated, shadowed,
-malformed, duplicate, or dependency definitions are unsupported.
+Only SDK-owned API, SPI, and provider classes and production provider
+registrations from their canonical reactor target/classes outputs are
+permitted. Test, generated, shadowed, malformed, duplicate, or dependency
+definitions are unsupported.
 "@
 }
 Write-Host (

@@ -389,11 +389,20 @@ case "$goal" in
       mkdir -p "$(dirname "$descriptor")"
       cp "$LIVE_COSMOS_TEST_DESCRIPTOR_FIXTURE" "$descriptor"
     fi
-    api_shadow="$PWD/multiclouddb-conformance/target/test-classes/com/multiclouddb/api/MulticloudDbClientFactory.class"
-    rm -f "$api_shadow"
-    if [ "${LIVE_COSMOS_TEST_API_SHADOW:-}" = "true" ]; then
-      mkdir -p "$(dirname "$api_shadow")"
-      cp "$PWD/multiclouddb-api/target/classes/com/multiclouddb/api/MulticloudDbClientFactory.class" "$api_shadow"
+    test_shadow_root="$PWD/multiclouddb-conformance/target/test-classes"
+    rm -f \
+      "$test_shadow_root/com/multiclouddb/api/MulticloudDbClientFactory.class" \
+      "$test_shadow_root/com/multiclouddb/spi/MulticloudDbProviderAdapter.class" \
+      "$test_shadow_root/com/multiclouddb/provider/cosmos/CosmosProviderAdapter.class" \
+      "$test_shadow_root/com/multiclouddb/provider/cosmos/CosmosProviderClient.class"
+    if [ -n "${LIVE_COSMOS_TEST_CLASS_SHADOW_RESOURCE:-}" ]; then
+      test_shadow="$test_shadow_root/$LIVE_COSMOS_TEST_CLASS_SHADOW_RESOURCE"
+      mkdir -p "$(dirname "$test_shadow")"
+      printf 'fixture shadow\n' > "$test_shadow"
+    fi
+    if [ -n "${LIVE_COSMOS_REMOVE_CANONICAL_CLASS_MODULE:-}" ] &&
+       [ -n "${LIVE_COSMOS_REMOVE_CANONICAL_CLASS_RESOURCE:-}" ]; then
+      rm -f "$PWD/$LIVE_COSMOS_REMOVE_CANONICAL_CLASS_MODULE/target/classes/$LIVE_COSMOS_REMOVE_CANONICAL_CLASS_RESOURCE"
     fi
     if [ "${LIVE_COSMOS_SKIP_CLASSPATH_FILE:-}" = "true" ]; then
       rm -f "$dependency_output"
@@ -1535,18 +1544,111 @@ $tamperedOutput
     -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
     -RunnerScript $fixtureRunner -BaseEnvironment $environment `
     -AdditionalEnvironment @{
-      LIVE_COSMOS_TEST_API_SHADOW = 'true'
+      LIVE_COSMOS_TEST_CLASS_SHADOW_RESOURCE =
+        'com/multiclouddb/api/MulticloudDbClientFactory.class'
     }
 
-  $multiReleaseArchive = Join-Path $providerFixtures `
-    'multi-release-shadow.jar'
-  New-FixtureArchive -Path $multiReleaseArchive -Entries ([ordered]@{
+  Invoke-ProviderMetadataFailureCase -Name 'spi-test-output-shadow' `
+    -Expected 'MulticloudDbProviderAdapter' `
+    -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
+    -RunnerScript $fixtureRunner -BaseEnvironment $environment `
+    -AdditionalEnvironment @{
+      LIVE_COSMOS_TEST_CLASS_SHADOW_RESOURCE =
+        'com/multiclouddb/spi/MulticloudDbProviderAdapter.class'
+    }
+
+  Invoke-ProviderMetadataFailureCase -Name 'provider-client-test-output-shadow' `
+    -Expected 'CosmosProviderClient' `
+    -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
+    -RunnerScript $fixtureRunner -BaseEnvironment $environment `
+    -AdditionalEnvironment @{
+      LIVE_COSMOS_TEST_CLASS_SHADOW_RESOURCE =
+        'com/multiclouddb/provider/cosmos/CosmosProviderClient.class'
+    }
+
+  foreach ($missingCanonicalCase in @(
+      @{
+        Name = 'missing-canonical-api-anchor'
+        Module = 'multiclouddb-api'
+        Resource =
+          'com/multiclouddb/api/MulticloudDbClientFactory.class'
+        ClassName =
+          'com.multiclouddb.api.MulticloudDbClientFactory'
+      },
+      @{
+        Name = 'missing-canonical-provider-anchor'
+        Module = 'multiclouddb-provider-cosmos'
+        Resource =
+          'com/multiclouddb/provider/cosmos/CosmosProviderAdapter.class'
+        ClassName =
+          'com.multiclouddb.provider.cosmos.CosmosProviderAdapter'
+      })) {
+    $canonicalClass = Join-Path $fixtureRoot (
+      "$($missingCanonicalCase.Module)/target/classes/" +
+      $missingCanonicalCase.Resource)
+    $savedCanonicalClass =
+      [IO.File]::ReadAllBytes($canonicalClass)
+    try {
+      Invoke-ProviderMetadataFailureCase `
+        -Name $missingCanonicalCase.Name `
+        -Expected $missingCanonicalCase.ClassName `
+        -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
+        -RunnerScript $fixtureRunner -BaseEnvironment $environment `
+        -AdditionalEnvironment @{
+          LIVE_COSMOS_REMOVE_CANONICAL_CLASS_MODULE =
+            $missingCanonicalCase.Module
+          LIVE_COSMOS_REMOVE_CANONICAL_CLASS_RESOURCE =
+            $missingCanonicalCase.Resource
+          LIVE_COSMOS_TEST_CLASS_SHADOW_RESOURCE =
+            $missingCanonicalCase.Resource
+        }
+    } finally {
+      New-Item -ItemType Directory -Path (
+        Split-Path -Parent $canonicalClass) -Force | Out-Null
+      [IO.File]::WriteAllBytes(
+        $canonicalClass, $savedCanonicalClass)
+    }
+  }
+
+  $providerClientResource =
+    'com/multiclouddb/provider/cosmos/CosmosProviderClient.class'
+  $providerClientArchive = Join-Path $providerFixtures `
+    'provider-client-shadow.jar'
+  New-FixtureArchive -Path $providerClientArchive -Entries ([ordered]@{
+      $providerClientResource = [byte[]]@(0)
+    })
+  Invoke-ProviderMetadataFailureCase -Name 'provider-client-jar-shadow' `
+    -Expected 'CosmosProviderClient' `
+    -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
+    -RunnerScript $fixtureRunner -BaseEnvironment $environment `
+    -ClasspathPrepend $providerClientArchive
+
+  $adapterMultiReleaseArchive = Join-Path $providerFixtures `
+    'adapter-multi-release-shadow.jar'
+  New-FixtureArchive -Path $adapterMultiReleaseArchive `
+    -Entries ([ordered]@{
       'META-INF/MANIFEST.MF' =
         "Manifest-Version: 1.0`r`nMulti-Release: true`r`n`r`n"
       "META-INF/versions/17/$cosmosClassResource" = [byte[]]@(0)
     })
+  Invoke-ProviderMetadataFailureCase `
+    -Name 'adapter-multi-release-shadow' `
+    -Expected 'CosmosProviderAdapter' `
+    -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
+    -RunnerScript $fixtureRunner -BaseEnvironment $environment `
+    -ClasspathPrepend $adapterMultiReleaseArchive
+
+  $multiReleaseArchive = Join-Path $providerFixtures `
+    'inner-class-multi-release-shadow.jar'
+  $providerClientInnerResource =
+    'com/multiclouddb/provider/cosmos/CosmosProviderClient$1.class'
+  New-FixtureArchive -Path $multiReleaseArchive -Entries ([ordered]@{
+      'META-INF/MANIFEST.MF' =
+        "Manifest-Version: 1.0`r`nMulti-Release: true`r`n`r`n"
+      "META-INF/versions/17/$providerClientInnerResource" = [byte[]]@(0)
+    })
   Invoke-ProviderMetadataFailureCase -Name 'multi-release-shadow' `
-    -Expected 'Multi-release' `
+    -Expected 'CosmosProviderClient$1' `
     -FixtureRoot $fixtureRoot -FixtureTemp $fixtureTemp `
     -RunnerScript $fixtureRunner -BaseEnvironment $environment `
     -ClasspathPrepend $multiReleaseArchive
